@@ -62,6 +62,9 @@ dino:
   jepa_pred_width: 0
   jepa_blocks: 4
   jepa_block_scale: 0.10
+  jepa_target_blocks: [12] # 1-indexed teacher blocks the predictor regresses; [12] = final block only
+  jepa_loss: smooth_l1_loss # torch.nn.functional name: smooth_l1_loss or mse_loss
+  jepa_loss_weight: 1.0 # scales the JEPA term against DINO+KDE; mse_loss is ~2.5x smooth_l1_loss at equal error
 
 probe:
   enabled: true

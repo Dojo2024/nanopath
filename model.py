@@ -150,18 +150,24 @@ class DinoV2ViT(nn.Module):
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
+    # `taps` are 1-indexed block numbers whose (pre-final-norm) patch tokens are also
+    # returned, so one teacher forward can supply JEPA targets at several depths.
+    def forward(self, x, masks=None, checkpoint=False, taps=()):
         x = self._prepare_tokens(x, masks)
-        for blk in self.blocks:
+        tapped = []
+        for i, blk in enumerate(self.blocks, start=1):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if i in taps:
+                tapped.append(x[:, 1 + self.registers :])
         x = self.norm(x)
         return {
             "x_norm_clstoken": x[:, 0],
             "x_norm_regtokens": x[:, 1 : 1 + self.registers],
             "x_norm_patchtokens": x[:, 1 + self.registers :],
+            "x_tapped_patchtokens": tapped,
         }
 
     # Probe contract: encode_image returns [registers || patches] for the seg head;
@@ -208,15 +214,16 @@ class DINOHead(nn.Module):
 
 
 # I-JEPA predictor head: regresses EMA-teacher patch representations at masked
-# target blocks from the student's block-masked patch tokens.
+# target blocks from the student's block-masked patch tokens. `n_targets` teacher
+# depths are regressed jointly by widening the output projection to n_targets * dim.
 class JEPAPredictor(nn.Module):
-    def __init__(self, dim, depth=4, width=0, heads=6):
+    def __init__(self, dim, depth=4, width=0, heads=6, n_targets=1):
         super().__init__()
         width = width or dim
         self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
         self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
         self.norm = nn.LayerNorm(width, eps=1e-6)
-        self.proj = nn.Linear(width, dim, bias=True)
+        self.proj = nn.Linear(width, dim * n_targets, bias=True)
 
     def forward(self, patch_tokens):
         patch_tokens = self.proj_in(patch_tokens)

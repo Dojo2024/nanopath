@@ -217,6 +217,8 @@ Full main `nanopath` recipe:
 # or directly on a GPU machine: `python train.py configs/main.yaml`
 ```
 
+Trailing `key=value` arguments override the YAML: `output_dir`, plus any dotted `section.name` path parsed as YAML, so a sweep can share one checked-in recipe (e.g. `configs/main.yaml output_dir=$RUN_DIR dino.jepa_target_blocks=[1,4,8,12] dino.jepa_loss=mse_loss`). Overrides land in `summary.json` and the W&B config, so submitted runs record what actually ran.
+
 `submit/train_1gpu.sbatch` is a prompt-aware launcher when run directly: it collects Labless run name, notes, and GitHub device login before submitting itself to SLURM, then auto-submits eligible completed full runs. Calling `sbatch submit/train_1gpu.sbatch ...` bypasses that prompt and trains without auto-submit. `configs/main.yaml` is sized for an 80 GB H100 at `train.batch_size: 128`. On smaller cards you can set `train.activation_checkpointing: true` and lower `train.batch_size` if you OOM.
 
 The checked-in `#SBATCH --partition=n` / `--qos=normal` lines are MedARC-specific. On another SLURM cluster, edit those header lines once to match your queue, or run `python train.py ...` directly on an allocated GPU.

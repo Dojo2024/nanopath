@@ -1,9 +1,10 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# I-JEPA patch-feature regression, and a KDE uniformity term on the
-# L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
-# LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
-# FLOP/sample budgets, batch size); other DINOv2 hyperparameters are hardcoded
+# I-JEPA patch-feature regression against one or more teacher depths, and a KDE
+# uniformity term on the L2-normalised CLS tokens. YAML drives the tunable knobs
+# (backbone variant, LR + LR scheduler, drop path, layerwise decay, KDE weight +
+# concentration, JEPA target depths + regression loss, FLOP/sample budgets,
+# batch size); other DINOv2 hyperparameters are hardcoded
 # inline at their use sites.
 
 import atexit
@@ -48,16 +49,19 @@ def console_prefix(): return f"{time.strftime('%H:%M:%S')} {os.environ.get('SLUR
 # expandvars is necessary to resolve `$USER` for checked-in configs.
 def load_config():
     if len(sys.argv) < 2:
-        raise ValueError("usage: python train.py <config.yaml> [output_dir=<path>]")
+        raise ValueError("usage: python train.py <config.yaml> [output_dir=<path>] [section.name=<yaml value> ...]")
     cfg = yaml.safe_load(os.path.expandvars(Path(sys.argv[1]).read_text()))
     cfg["config_path"] = str(Path(sys.argv[1]).resolve())
-    # Optional `key=value` overrides after the config; only output_dir is supported,
-    # since it's the run identifier and routinely set per-submission from the CLI.
+    # Optional `key=value` overrides after the config: `output_dir` (the run identifier,
+    # routinely set per-submission) plus dotted `section.name` paths parsed as YAML, e.g.
+    # `dino.jepa_loss=mse_loss`, so a sweep can share one checked-in recipe.
     for arg in sys.argv[2:]:
         key, _, value = arg.partition("=")
-        if key != "output_dir":
-            raise ValueError(f"unsupported override {arg!r}; only output_dir=<path> is supported")
-        cfg["project"]["output_dir"] = os.path.expandvars(value)
+        if key == "output_dir":
+            cfg["project"]["output_dir"] = os.path.expandvars(value)
+        else:
+            section, _, name = key.partition(".")
+            cfg[section][name] = yaml.safe_load(value)
     dataset_dir = Path(cfg["data"]["dataset_dir"])
     if not any(dataset_dir.glob("shard-*.parquet")):
         raise FileNotFoundError(
@@ -238,7 +242,11 @@ def main():
         p.requires_grad = False
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
-    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"])).to(device)
+    # Teacher depths regressed by the JEPA predictor (1-indexed blocks) and the regression
+    # loss name resolved off torch.nn.functional, both swept from the CLI.
+    target_blocks = tuple(dino_cfg["jepa_target_blocks"])
+    jepa_criterion = getattr(F, dino_cfg["jepa_loss"])
+    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_targets=len(target_blocks)).to(device)
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
@@ -413,7 +421,7 @@ def main():
     # schedule values. Used by both the train step and evaluate() (no_grad).
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False):
         with torch.no_grad():
-            t = teacher_backbone(gf)
+            t = teacher_backbone(gf, taps=target_blocks)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
@@ -422,9 +430,13 @@ def main():
         L = train_cfg["local_views"]
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
-        target = F.layer_norm(t["x_norm_patchtokens"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
+        # Each tapped teacher depth is standardized on its own before concatenation; jointly
+        # standardizing the stack loses the per-depth scale and trains notably worse.
+        target = torch.cat([F.layer_norm(p.flatten(0, 1), (student_backbone.embed_dim,)) for p in t["x_tapped_patchtokens"]], dim=-1)[mask_idx]
         pred = student_predictor(sg["x_norm_patchtokens"]).flatten(0, 1)[mask_idx]
-        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        # jepa_loss_weight keeps the JEPA term's share of the unweighted DINO+JEPA+KDE sum
+        # comparable across regression losses: mse_loss runs ~2.5x smooth_l1_loss at equal error.
+        jepa_loss = dino_cfg["jepa_loss_weight"] * jepa_criterion(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         return local_loss + global_loss, jepa_loss, kde
 
@@ -710,6 +722,9 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
+        "jepa_target_blocks": list(target_blocks),
+        "jepa_loss": dino_cfg["jepa_loss"],
+        "jepa_loss_weight": dino_cfg["jepa_loss_weight"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
