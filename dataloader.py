@@ -187,6 +187,9 @@ class TCGATileDataset(Dataset):
             idx = random.randint(0, self.shard_of.shape[0] - 1)
         slide_stem = rel.split("/", 1)[0]
         patient_id = "-".join(slide_stem.split("-")[:3])
+        # TCGA barcodes are TCGA-<site>-<patient>-...; the second field is the tissue source site,
+        # i.e. the submitting institution, which train.py uses as a free medical-centre label.
+        site_key = int.from_bytes(hashlib.blake2b(slide_stem.split("-")[1].encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         slide_key = int.from_bytes(hashlib.blake2b(slide_stem.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
@@ -198,4 +201,5 @@ class TCGATileDataset(Dataset):
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            "site_id": torch.tensor(site_key, dtype=torch.int64),
         }

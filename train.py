@@ -166,6 +166,19 @@ def kde_loss(x, concentration):
     return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
+# ScanGen-style site decorrelation on L2-normalised CLS tokens. Penalises how much *more*
+# similar two different patients are when they share a TCGA submitting site than when they do
+# not. The contrast form is zero when site carries no signal, so unlike a bare same-site
+# repulsion it cannot be minimised by spreading every embedding apart (the KDE term's job).
+# Targets the PathoROB column, which scores same-biology-other-centre neighbours against
+# other-biology-same-centre ones.
+def site_repulsion(x, site, patient):
+    sim = F.normalize(x, p=2, dim=-1) @ F.normalize(x, p=2, dim=-1).T
+    diff_patient = patient[:, None] != patient[None, :]
+    same, other = diff_patient & (site[:, None] == site[None, :]), diff_patient & (site[:, None] != site[None, :])
+    return sim[same].sum() / same.sum().clamp(min=1) - sim[other].sum() / other.sum().clamp(min=1)
+
+
 # I-JEPA target mask: contiguous square blocks so the predictor must infer missing tissue context.
 def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
     masks = torch.zeros(batch, grid, grid, dtype=torch.bool, device=device)
@@ -419,7 +432,7 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, site, patient, ckpt=False):
         with torch.no_grad():
             t = teacher_backbone(gf, taps=target_blocks)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
@@ -438,7 +451,8 @@ def main():
         # comparable across regression losses: mse_loss runs ~2.5x smooth_l1_loss at equal error.
         jepa_loss = dino_cfg["jepa_loss_weight"] * jepa_criterion(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
-        return local_loss + global_loss, jepa_loss, kde
+        site_rep = dino_cfg["site_repulsion_weight"] * sum(site_repulsion(x, site, patient) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
+        return local_loss + global_loss, jepa_loss, kde, site_rep
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -449,23 +463,24 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(4, device=device)
+        sums = torch.zeros(5, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
                 break
             vg, vl = vbatch["global_views"].to(device, non_blocking=True), vbatch["local_views"].to(device, non_blocking=True)
+            vsite, vpat = vbatch["site_id"].to(device, non_blocking=True), vbatch["patient_id"].to(device, non_blocking=True)
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
-            sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
+                dino_l, jepa_l, kde_v, site_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale, vsite, vpat)
+            sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(site_v), float(dino_l + jepa_l + kde_v + site_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "jepa", "kde", "total"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "jepa", "kde", "site", "total"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -562,11 +577,12 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, jepa_loss, kde = compute_losses(
+                    dino_loss_value, jepa_loss, kde, site_rep = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
+                        batch["site_id"].to(device, non_blocking=True), batch["patient_id"].to(device, non_blocking=True),
                         ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + jepa_loss + kde
+                    total_loss = dino_loss_value + jepa_loss + kde + site_rep
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
@@ -591,6 +607,7 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     "jepa": float(jepa_loss.detach()),
                     "kde": float(kde.detach()),
+                    "site_rep": float(site_rep.detach()),
                     "total": float(total_loss.detach()),
                 }
                 unique_counts = flush_unique_counts()
@@ -647,7 +664,7 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  jepa: {reduced['jepa']:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  jepa: {reduced['jepa']:.4f}  kde: {reduced['kde']:.4f}  site: {reduced['site_rep']:.4f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -676,7 +693,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  jepa: {val['jepa']:.4f}  kde: {val['kde']:.4f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  jepa: {val['jepa']:.4f}  kde: {val['kde']:.4f}  site: {val['site']:.4f}", flush=True)
             step = completed_step
             data_wait_started_at = time.monotonic()
             if train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
@@ -732,6 +749,7 @@ def main():
         "jepa_loss": dino_cfg["jepa_loss"],
         "jepa_loss_weight": dino_cfg["jepa_loss_weight"],
         "schedule_key": dino_cfg["schedule_key"],
+        "site_repulsion_weight": dino_cfg["site_repulsion_weight"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
