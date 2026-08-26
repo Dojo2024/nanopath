@@ -531,13 +531,19 @@ def main():
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
             global_views, local_views = [batch[key].to(device, non_blocking=True) for key in ("global_views", "local_views")]
             visible_now = batch_size * (train_cfg["global_views"] * global_patches + train_cfg["local_views"] * local_patches)
-            # LR warmup uses the 1M-tile sample cap; decay/WD/teacher/freeze/KDE stay on the public FLOP budget.
-            frac = min(1.0, train_flops / max_train_flops)
+            # LR warmup uses the 1M-tile sample cap. Keyed to FLOPs the remaining schedules only
+            # traverse ~20% of their range, because the run stops at the sample cap at ~0.20 of the
+            # 1e18 budget: the LR then ends at 96% of peak, i.e. it never anneals. schedule_key
+            # re-keys the LR alone ("lr_only") or every schedule ("samples") to the binding cap.
+            sample_frac = min(1.0, examples_seen / max_train_samples)
+            flop_frac = min(1.0, train_flops / max_train_flops)
+            frac = sample_frac if dino_cfg["schedule_key"] == "samples" else flop_frac
+            lr_frac = sample_frac if dino_cfg["schedule_key"] in ("samples", "lr_only") else flop_frac
             warmup = min(1.0, examples_seen / max(1, warmup_train_samples))
             if warmup < 1.0:
                 lr = dino_cfg["lr"] * warmup
             else:
-                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
+                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (lr_frac - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
             wd = cosine_schedule(0.04, 0.2, frac)
             teacher_temp = 0.04 + min(1.0, frac / 0.2727) * (0.07 - 0.04)
             last_layer_lr = 0.0 if frac < dino_cfg["freeze_last_layer_fraction"] else lr
@@ -725,6 +731,7 @@ def main():
         "jepa_target_blocks": list(target_blocks),
         "jepa_loss": dino_cfg["jepa_loss"],
         "jepa_loss_weight": dino_cfg["jepa_loss_weight"],
+        "schedule_key": dino_cfg["schedule_key"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
