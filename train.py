@@ -240,6 +240,10 @@ def update_ema(student_module, teacher_module, momentum):
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
 def main():
     cfg = load_config()
+    # The probe subprocess rebuilds the model from `variant` alone, so the readout depth
+    # selection reaches it through the environment it inherits (see model.probe_readout).
+    os.environ["NANOPATH_PROBE_LAYERS"] = ",".join(str(v) for v in cfg["model"]["probe_layers"])
+    os.environ["NANOPATH_PROBE_REDUCE"] = str(cfg["model"]["probe_reduce"])
     repo_dir = Path(__file__).resolve().parent
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
@@ -451,7 +455,7 @@ def main():
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         # Each tapped teacher depth is standardized on its own before concatenation; jointly
         # standardizing the stack loses the per-depth scale and trains notably worse.
-        target = torch.cat([F.layer_norm(p.flatten(0, 1), (student_backbone.embed_dim,)) for p in t["x_tapped_patchtokens"]], dim=-1)[mask_idx]
+        target = torch.cat([F.layer_norm(p.flatten(0, 1), (student_backbone.embed_dim,)) for p in (v[:, 1 + student_backbone.registers :] for v in t["x_tapped"])], dim=-1)[mask_idx]
         pred = student_predictor(sg["x_norm_patchtokens"]).flatten(0, 1)[mask_idx]
         # jepa_loss_weight keeps the JEPA term's share of the unweighted DINO+JEPA+KDE sum
         # comparable across regression losses: mse_loss runs ~2.5x smooth_l1_loss at equal error.

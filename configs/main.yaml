@@ -22,6 +22,8 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  probe_layers: [4, 6, 8, 11] # 1-indexed blocks the frozen-feature probes read; +0.0107 over [12]
+  probe_reduce: concat # how multiple probe_layers combine: concat (n*384-d) | mean (384-d)
 
 train:
   seed: 7777

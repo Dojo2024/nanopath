@@ -9,6 +9,8 @@
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +18,16 @@ from torchvision import transforms
 
 
 # (dim, depth, heads, pretrain_grid, ffn, pos_has_cls, weight URL[, registers]) for each supported variant.
+# Which blocks the frozen-feature probes read out, as 1-indexed block numbers plus concat|mean.
+# probe.py rebuilds the model as `DinoV2ViT(variant=cfg["model"]["type"])` and can be passed
+# nothing else, so the setting travels through the environment: train.py exports these two from
+# `model.probe_layers` / `model.probe_reduce` before launching the probe subprocess, which
+# inherits os.environ. The default "12"/concat is the final block alone, i.e. the original
+# single-CLS readout, so an unset environment reproduces the previous behaviour exactly.
+def probe_readout():
+    return tuple(int(v) for v in os.environ.get("NANOPATH_PROBE_LAYERS", "12").split(",")), os.environ.get("NANOPATH_PROBE_REDUCE", "concat")
+
+
 DINOV2_VARIANTS = {
     "dinov2_vits14_reg": (384, 12, 6, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"),
     "dinov2_vitb14_reg": (768, 12, 12, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth"),
@@ -150,34 +162,50 @@ class DinoV2ViT(nn.Module):
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    # `taps` are 1-indexed block numbers whose (pre-final-norm) patch tokens are also
-    # returned, so one teacher forward can supply JEPA targets at several depths.
+    # `taps` are 1-indexed block numbers whose full (pre-final-norm) token sequences are also
+    # returned, so one forward can supply JEPA targets or probe features at several depths.
+    # Tapped blocks are cached by index and then gathered in `taps` order, so a depth may repeat
+    # (e.g. (12, 12, 12, 12) builds a wider readout carrying no more information than (12,)).
     def forward(self, x, masks=None, checkpoint=False, taps=()):
         x = self._prepare_tokens(x, masks)
-        tapped = []
+        cache = {}
         for i, blk in enumerate(self.blocks, start=1):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
-            if i in taps:
-                tapped.append(x[:, 1 + self.registers :])
+            if i in set(taps):
+                cache[i] = x
         x = self.norm(x)
         return {
             "x_norm_clstoken": x[:, 0],
             "x_norm_regtokens": x[:, 1 : 1 + self.registers],
             "x_norm_patchtokens": x[:, 1 + self.registers :],
-            "x_tapped_patchtokens": tapped,
+            "x_tapped": [cache[i] for i in taps],
         }
 
     # Probe contract: encode_image returns [registers || patches] for the seg head;
-    # probe_features returns the cls token for classification probes.
+    # probe_features returns the cls token for classification probes. Both read the depths named
+    # by probe_readout() rather than the final block alone. self.norm is applied to each tapped
+    # block, matching DINOv2's get_intermediate_layers(norm=True), so every depth arrives on one
+    # scale; without it the blocks' native scales differ by ~an order of magnitude and concat is
+    # dominated by whichever block happens to be largest.
+    # "concat" widens the feature (n_depths * embed_dim), "mean" averages back to embed_dim, which
+    # is what separates a genuine depth effect from the probe simply getting more columns to fit.
+    def _readout(self, x, checkpoint=False):
+        layers, reduce = probe_readout()
+        tapped = [self.norm(t) for t in self(x, checkpoint=checkpoint, taps=layers)["x_tapped"]]
+        return tapped, reduce
+
     def encode_image(self, x, checkpoint=False):
-        out = self(x, checkpoint=checkpoint)
-        return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
+        tapped, reduce = self._readout(x, checkpoint)
+        merged = torch.cat(tapped, dim=-1) if reduce == "concat" else torch.stack(tapped).mean(0)
+        return merged[:, 1:]
 
     def probe_features(self, x):
-        return self(x)["x_norm_clstoken"]
+        tapped, reduce = self._readout(x)
+        cls = [t[:, 0] for t in tapped]
+        return torch.cat(cls, dim=-1) if reduce == "concat" else torch.stack(cls).mean(0)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
