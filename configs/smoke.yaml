@@ -61,7 +61,9 @@ dino:
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4
-  jepa_block_scale: 0.10
+  jepa_block_scale: 0.10 # per-rectangle area as a fraction of the grid; lower end of the range
+  jepa_block_scale_max: 0.10 # upper end; equal to jepa_block_scale gives a fixed-area block
+  jepa_block_aspect: 1.0 # each block draws aspect ratio in [1/a, a]; 1.0 = square
   jepa_target_blocks: [12] # 1-indexed teacher blocks the predictor regresses; [12] = final block only
   jepa_loss: smooth_l1_loss # torch.nn.functional name: smooth_l1_loss or mse_loss
   site_repulsion_weight: 0.0 # ScanGen-style TCGA-site decorrelation on CLS; 0 disables

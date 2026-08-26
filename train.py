@@ -180,14 +180,20 @@ def site_repulsion(x, site, patient):
 
 
 # I-JEPA target mask: contiguous square blocks so the predictor must infer missing tissue context.
-def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
+def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10, block_scale_max=0.10, block_aspect=1.0):
     masks = torch.zeros(batch, grid, grid, dtype=torch.bool, device=device)
-    side = max(1, round(grid * block_scale ** 0.5))
     for i in range(batch):
         for _ in range(n_blocks):
-            top = random.randint(0, grid - side)
-            left = random.randint(0, grid - side)
-            masks[i, top : top + side, left : left + side] = True
+            # I-JEPA/Bootleg "multiblock" geometry: each rectangle draws its own area and aspect
+            # ratio, so the blocks vary in shape instead of being n_blocks copies of one square.
+            # block_scale == block_scale_max and block_aspect == 1.0 reproduces the fixed square.
+            area = random.uniform(block_scale, block_scale_max) * grid * grid
+            ratio = random.uniform(1 / block_aspect, block_aspect)
+            h = min(grid, max(1, round((area / ratio) ** 0.5)))
+            w = min(grid, max(1, round((area * ratio) ** 0.5)))
+            top = random.randint(0, grid - h)
+            left = random.randint(0, grid - w)
+            masks[i, top : top + h, left : left + w] = True
     masks = masks.flatten(1)
     idx = masks.flatten().nonzero().flatten()
     weights = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
@@ -473,7 +479,7 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
+                masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]), block_scale_max=float(dino_cfg["jepa_block_scale_max"]), block_aspect=float(dino_cfg["jepa_block_aspect"]))
                 dino_l, jepa_l, kde_v, site_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale, vsite, vpat)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(site_v), float(dino_l + jepa_l + kde_v + site_v)], device=device)
             n_batches += 1
@@ -566,7 +572,7 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
+            masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]), block_scale_max=float(dino_cfg["jepa_block_scale_max"]), block_aspect=float(dino_cfg["jepa_block_aspect"]))
             kde_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -749,6 +755,8 @@ def main():
         "jepa_loss": dino_cfg["jepa_loss"],
         "jepa_loss_weight": dino_cfg["jepa_loss_weight"],
         "schedule_key": dino_cfg["schedule_key"],
+        "jepa_block_scale_max": dino_cfg["jepa_block_scale_max"],
+        "jepa_block_aspect": dino_cfg["jepa_block_aspect"],
         "site_repulsion_weight": dino_cfg["site_repulsion_weight"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
