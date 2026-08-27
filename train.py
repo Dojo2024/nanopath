@@ -51,13 +51,16 @@ def load_config():
         raise ValueError("usage: python train.py <config.yaml> [output_dir=<path>]")
     cfg = yaml.safe_load(os.path.expandvars(Path(sys.argv[1]).read_text()))
     cfg["config_path"] = str(Path(sys.argv[1]).resolve())
-    # Optional `key=value` overrides after the config; only output_dir is supported,
-    # since it's the run identifier and routinely set per-submission from the CLI.
+    # Optional `key=value` overrides after the config: `output_dir` (the run identifier, routinely
+    # set per-submission) plus any dotted `section.name` path, whose value is parsed as YAML so a
+    # sweep can share one checked-in recipe instead of forking a config file per cell.
     for arg in sys.argv[2:]:
         key, _, value = arg.partition("=")
-        if key != "output_dir":
-            raise ValueError(f"unsupported override {arg!r}; only output_dir=<path> is supported")
-        cfg["project"]["output_dir"] = os.path.expandvars(value)
+        if key == "output_dir":
+            cfg["project"]["output_dir"] = os.path.expandvars(value)
+        else:
+            section, _, name = key.partition(".")
+            cfg[section][name] = yaml.safe_load(value)
     dataset_dir = Path(cfg["data"]["dataset_dir"])
     if not any(dataset_dir.glob("shard-*.parquet")):
         raise FileNotFoundError(
@@ -154,6 +157,24 @@ def dino_ce(student, teacher):
     return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
 
 
+# SIGReg (LeJEPA, arXiv 2511.08544): push the embedding distribution toward an isotropic Gaussian
+# instead of toward uniformity on the sphere. The multivariate test is sketched into `slices` random
+# 1-D projections, and each slice is scored by the Epps-Pulley statistic -- the squared distance
+# between the empirical characteristic function and N(0,1)'s exp(-t^2/2), integrated against a
+# Gaussian weight over t in [-5, 5] by the trapezoid rule.
+#
+# Unlike kde_loss this deliberately does NOT L2-normalise: the target is a Gaussian in R^d, so the
+# radial distribution is part of what is being fit rather than something projected away. The paper's
+# extra factor of N is dropped -- it is a constant rescale that sigreg_loss_weight already absorbs.
+def sigreg_loss(x, slices, quad):
+    directions = F.normalize(torch.randn(x.shape[-1], slices, device=x.device, dtype=x.dtype), dim=0)
+    proj = x @ directions
+    t = torch.linspace(-5.0, 5.0, quad, device=x.device, dtype=x.dtype)
+    angle = t[:, None, None] * proj[None]
+    real, imag = angle.cos().mean(1) - torch.exp(-t[:, None] ** 2 / 2), angle.sin().mean(1)
+    return torch.trapezoid((real ** 2 + imag ** 2) * torch.exp(-t[:, None] ** 2 / 2), t, dim=0).mean()
+
+
 # KDE uniformity loss on L2-normalised CLS tokens.
 def kde_loss(x, concentration):
     x = F.normalize(x, p=2, dim=-1)
@@ -217,6 +238,11 @@ def update_ema(student_module, teacher_module, momentum):
 # Orchestrates one pretraining run: setup, train+probe loop, checkpoint, summary.
 def main():
     cfg = load_config()
+    # The probe subprocess rebuilds the model from `model.type` alone, so the readout choice
+    # reaches it through the environment it inherits (see model.probe_readout).
+    os.environ["NANOPATH_PROBE_LAYERS"] = ",".join(str(v) for v in cfg["model"]["probe_layers"])
+    os.environ["NANOPATH_PROBE_SEG"] = str(cfg["model"]["probe_seg"])
+    os.environ["NANOPATH_PROBE_POOL"] = str(cfg["model"]["probe_pool"])
     repo_dir = Path(__file__).resolve().parent
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
@@ -384,7 +410,17 @@ def main():
     loader_kwargs = dict(batch_size=batch_size, drop_last=True, num_workers=train_cfg["num_workers"], pin_memory=True,
                          prefetch_factor=train_cfg["prefetch_factor"] if train_cfg["num_workers"] > 0 else None,
                          persistent_workers=train_cfg["persistent_workers"] and train_cfg["num_workers"] > 0)
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    # Batch stratification: round-robin over top-level curation clusters so each batch of
+    # `batch_size` holds one tile per cluster. The curation paper finds this is the component that
+    # decides the outcome -- curating without it scores *below* uncurated training (T1-BR 79.8 vs
+    # F-BR 79.9), while curating with it wins (T1-BS 82.0) -- because a heavy-tailed pool otherwise
+    # lets a few dense morphologies dominate every gradient step.
+    train_sampler = None
+    if train_ds.cluster_of is not None:
+        rng = np.random.default_rng(int(train_cfg["seed"]))
+        queues = [rng.permutation(np.nonzero(train_ds.cluster_of == c)[0]) for c in np.unique(train_ds.cluster_of)]
+        train_sampler = [int(q[i]) for i in range(max(len(q) for q in queues)) for q in queues if i < len(q)]
+    train_loader = DataLoader(train_ds, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
@@ -453,7 +489,13 @@ def main():
         target = F.layer_norm(t["x_norm_patchtokens"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
         pred = student_predictor(sg["x_norm_patchtokens"], cond).flatten(0, 1)[mask_idx]
         jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
-        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
+        # Both collapse regularisers share the k_scale ramp and the same CLS views, so setting one
+        # weight to 0 swaps them cleanly and leaving both non-zero runs them together.
+        views = sg["x_norm_clstoken"].chunk(train_cfg["global_views"])
+        kde = k_scale * (
+            dino_cfg["kde_loss_weight"] * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in views)
+            + dino_cfg["sigreg_loss_weight"] * sum(sigreg_loss(x, int(dino_cfg["sigreg_slices"]), int(dino_cfg["sigreg_quad"])) for x in views)
+        )
         # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
         # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
         # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing

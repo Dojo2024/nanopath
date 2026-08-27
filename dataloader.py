@@ -127,6 +127,18 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # Tile-level curation (curation/cluster.py): restrict training to the balanced subset sampled
+        # from a hierarchical k-means tree over frozen-DINOv2 tile embeddings, and carry each kept
+        # tile's top-level cluster id so train.py can stratify batches over the tree. The run is
+        # sample-bound at 1M presentations out of a ~4M pool, so *which* 1M we spend is a free lever.
+        self.cluster_of = None
+        if data.get("curated_index") and is_train:
+            gid = np.concatenate([[0], np.cumsum(shard_sizes)])[:-1][self.shard_of] + self.row_of
+            keep = np.load(data["curated_index"])
+            pos = np.searchsorted(gid, keep)
+            assert np.array_equal(gid[pos], keep), "curated index does not match this train split"
+            self.shard_of, self.row_of = self.shard_of[pos], self.row_of[pos]
+            self.cluster_of = np.load(Path(data["curated_index"]).with_name("curated_top.npy"))
         # FINO metadata, built/copied once by prepare.py: per-factor barcode->id (discrete) / barcode->value
         # (continuous, z-scored) maps. cfg.fino.discrete/continuous select factors and their sign (+ encourage /
         # - suppress). Loaded once so DataLoader fork-workers share it copy-on-write; train.py masks absent ones.

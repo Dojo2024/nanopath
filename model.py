@@ -9,17 +9,43 @@
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.layers.pos_embed_sincos import RotaryEmbeddingDinoV3, apply_rot_embed_cat
 from torchvision import transforms
 
 
 # (dim, depth, heads, pretrain_grid, ffn, pos_has_cls, weight URL[, registers]) for each supported variant.
+# Probe readout selection. NANOPATH_PROBE_LAYERS is a comma-separated list of 1-INDEXED blocks
+# whose normalized CLS tokens the classification probes concatenate; NANOPATH_PROBE_SEG picks the
+# segmentation feature map ("dense" = last four blocks guided-upsampled to 32x32, "plain" = the
+# final block at the native 16x16 grid). probe.py rebuilds the model as DinoV2ViT(variant=...) and
+# can be passed nothing else, so train.py exports both from cfg["model"] and the probe subprocess
+# inherits them. Defaults reproduce this branch: 1-indexed 5,7,9,12 (the hardcoded 0-indexed
+# 4,6,8,11) with the dense segmentation map.
+# NANOPATH_PROBE_POOL adds spatially-pooled context to each tapped layer's classification vector:
+# "cls" is CLS alone, "patch" appends the mean over that layer's patch tokens, "reg" appends the
+# mean over its four register tokens. Combine with "+" (e.g. "cls+patch"); order follows cls, patch, reg.
+def probe_readout():
+    return (
+        tuple(int(v) for v in os.environ.get("NANOPATH_PROBE_LAYERS", "5,7,9,12").split(",")),
+        os.environ.get("NANOPATH_PROBE_SEG", "dense"),
+        os.environ.get("NANOPATH_PROBE_POOL", "cls"),
+    )
+
+
 DINOV2_VARIANTS = {
     "dinov2_vits14_reg": (384, 12, 6, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"),
     "dinov2_vitb14_reg": (768, 12, 12, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth"),
     "dinov2_vitg14_reg": (1536, 40, 24, 37, "swiglu", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth"),
+    # DINOv3 ViT-S/16. Positions come from axial RoPE applied to q/k inside attention rather than a
+    # learned pos_embed, qkv carries no bias, and LayerNorm eps is 1e-5 not 1e-6. Weights are the
+    # ungated timm mirror of facebook/dinov3-vits16-pretrain-lvd1689m; DINOv3 is LVD-1689M (natural
+    # images, no pathology), so it is an allowed initialisation. Trailing slots: registers, patch, rope temp.
+    "dinov3_vits16": (384, 12, 6, 0, "mlp", False, "timm/vit_small_patch16_dinov3.lvd1689m", 4, 16, 100.0),
 }
 
 
@@ -57,16 +83,22 @@ class GradScale(torch.autograd.Function):
 
 # Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
 class Attention(nn.Module):
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, qkv_bias=True, n_prefix=0):
         super().__init__()
-        self.heads = heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.heads, self.n_prefix = heads, n_prefix
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim, bias=True)
 
-    def forward(self, x):
+    # `rope` is DINOv3's (HW, 2*head_dim) sin/cos table; it rotates q/k for patch tokens only,
+    # leaving the cls and register prefix unrotated (they have no spatial position).
+    def forward(self, x, rope=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        if rope is not None:
+            n = self.n_prefix
+            q = torch.cat([q[:, :, :n], apply_rot_embed_cat(q[:, :, n:], rope, half=True)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :n], apply_rot_embed_cat(k[:, :, n:], rope, half=True)], dim=2).type_as(v)
         out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, C)
         return self.proj(out)
 
@@ -85,14 +117,14 @@ class SwiGLU(nn.Module):
 
 # Standard pre-LN block: attn + ls1 + drop_path, then mlp + ls2 + drop_path.
 class Block(nn.Module):
-    def __init__(self, dim, heads, mlp_ratio, drop_path_p, ffn="mlp"):
+    def __init__(self, dim, heads, mlp_ratio, drop_path_p, ffn="mlp", eps=1e-6, qkv_bias=True, n_prefix=0):
         super().__init__()
         hidden = int(dim * mlp_ratio)
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = Attention(dim, heads)
+        self.norm1 = nn.LayerNorm(dim, eps=eps)
+        self.attn = Attention(dim, heads, qkv_bias=qkv_bias, n_prefix=n_prefix)
         self.ls1 = LayerScale(dim)
         self.drop_path1 = DropPath(drop_path_p)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, eps=eps)
         self.mlp = SwiGLU(dim, hidden) if ffn == "swiglu" else nn.Sequential()
         if ffn == "mlp":
             self.mlp.fc1 = nn.Linear(dim, hidden, bias=True)
@@ -102,8 +134,8 @@ class Block(nn.Module):
 
     def _ff(self, x): return self.mlp(x) if isinstance(self.mlp, SwiGLU) else self.mlp.fc2(F.gelu(self.mlp.fc1(x)))
 
-    def forward(self, x):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+    def forward(self, x, rope=None):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), rope)))
         x = x + self.drop_path2(self.ls2(self._ff(self.norm2(x))))
         return x
 
@@ -118,7 +150,10 @@ class DinoV2ViT(nn.Module):
         super().__init__()
         cfg = variant_cfg or DINOV2_VARIANTS[variant]
         dim, depth, heads, pretrain_grid, ffn, pos_has_cls, _ = cfg[:7]
-        mlp_ratio, patch, registers = 4.0, 14, cfg[7] if len(cfg) > 7 else 4
+        registers = cfg[7] if len(cfg) > 7 else 4
+        mlp_ratio, patch = 4.0, cfg[8] if len(cfg) > 8 else 14
+        rope_temp = cfg[9] if len(cfg) > 9 else None
+        eps = 1e-5 if rope_temp else 1e-6
         self.variant = variant
         self.patch_size, self.registers, self.embed_dim = patch, registers, dim
         self._pretrain_grid, self._pos_has_cls = pretrain_grid, pos_has_cls
@@ -126,11 +161,17 @@ class DinoV2ViT(nn.Module):
         self.patch_embed.proj = nn.Conv2d(3, dim, kernel_size=patch, stride=patch, bias=True)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.register_tokens = nn.Parameter(torch.zeros(1, registers, dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, int(self._pos_has_cls) + self._pretrain_grid**2, dim))
+        # RoPE variants carry no positional parameters at all; the sin/cos table is derived per grid.
+        self.rope = RotaryEmbeddingDinoV3(dim // heads, temperature=rope_temp, normalize_coords="separate") if rope_temp else None
+        self.pos_embed = None if rope_temp else nn.Parameter(torch.zeros(1, int(pos_has_cls) + pretrain_grid**2, dim))
+        # DINOv3 ships no mask_token, so JEPA masking gets a freshly initialised one either way.
         self.mask_token = nn.Parameter(torch.zeros(1, dim))
         rates = [drop_path_rate * i / max(1, depth - 1) for i in range(depth)]
-        self.blocks = nn.ModuleList(Block(dim, heads, mlp_ratio, p, ffn=ffn) for p in rates)
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.blocks = nn.ModuleList(
+            Block(dim, heads, mlp_ratio, p, ffn=ffn, eps=eps, qkv_bias=rope_temp is None, n_prefix=1 + registers)
+            for p in rates
+        )
+        self.norm = nn.LayerNorm(dim, eps=eps)
 
     # Bicubic resample of the checkpoint patch-pos grid to the current (h, w) grid.
     def _interpolate_pos_embed(self, h, w):
@@ -151,21 +192,30 @@ class DinoV2ViT(nn.Module):
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
         cls = self.cls_token.expand(B, -1, -1)
         regs = self.register_tokens.expand(B, -1, -1)
+        if self.rope is not None:
+            return torch.cat([cls, regs, x], dim=1)
         if self._pos_has_cls:
             x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
             return torch.cat([x[:, :1], regs, x[:, 1:]], dim=1)
         return torch.cat([cls, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
 
+    # Per-grid RoPE sin/cos table (None for the learned-pos_embed DINOv2 variants).
+    def _rope_embed(self, x):
+        if self.rope is None:
+            return None
+        return self.rope.get_embed([x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size]).to(x.dtype)
+
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
     def forward(self, x, masks=None, checkpoint=False):
+        rope = self._rope_embed(x)
         x = self._prepare_tokens(x, masks)
         for blk in self.blocks:
             if checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(blk, x, rope, use_reentrant=False)
             else:
-                x = blk(x)
+                x = blk(x, rope)
         x = self.norm(x)
         return {
             "x_norm_clstoken": x[:, 0],
@@ -176,13 +226,17 @@ class DinoV2ViT(nn.Module):
     # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
     # and strided-depth CLS features that are less tied to the final DINO head.
     def encode_image(self, x, checkpoint=False):
+        if probe_readout()[1] == "plain":
+            out = self(x, checkpoint=checkpoint)
+            return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
         B, _, H, W = x.shape
         h, w, G = H // self.patch_size, W // self.patch_size, 32
         guide = x.mean(1, keepdim=True)
         guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        rope = self._rope_embed(x)
         xt, feats = self._prepare_tokens(x), []
         for i, blk in enumerate(self.blocks):
-            xt = torch.utils.checkpoint.checkpoint(blk, xt, use_reentrant=False) if checkpoint and self.training else blk(xt)
+            xt = torch.utils.checkpoint.checkpoint(blk, xt, rope, use_reentrant=False) if checkpoint and self.training else blk(xt, rope)
             if i >= len(self.blocks) - 4:
                 feats.append(self.norm(xt)[:, 1:])
         fused = torch.cat(feats, -1)
@@ -195,20 +249,41 @@ class DinoV2ViT(nn.Module):
         dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
         return torch.cat([regs, dense], dim=1)
 
+    # Blocks are cached by 1-indexed depth then gathered in order, so a depth may repeat (e.g.
+    # 12,12,12,12 widens the feature without adding information -- the control for probe width).
     def probe_features(self, x):
-        xt, feats = self._prepare_tokens(x), []
-        for i, blk in enumerate(self.blocks):
-            xt = blk(xt)
-            if i in (4, 6, 8, 11):
-                feats.append(self.norm(xt)[:, 0])
-        return torch.cat(feats, dim=-1)
+        layers, _, pool = probe_readout()
+        parts = pool.split("+")
+        rope = self._rope_embed(x)
+        xt, cache = self._prepare_tokens(x), {}
+        for i, blk in enumerate(self.blocks, start=1):
+            xt = blk(xt, rope)
+            if i in set(layers):
+                t = self.norm(xt)
+                cache[i] = torch.cat(
+                    [t[:, 0]]
+                    + ([t[:, 1 + self.registers :].mean(1)] if "patch" in parts else [])
+                    + ([t[:, 1 : 1 + self.registers].mean(1)] if "reg" in parts else []),
+                    dim=-1,
+                )
+        return torch.cat([cache[i] for i in layers], dim=-1)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
 # Strict matches our key layout against Meta's; any drift fails loudly per AGENTS.md.
 def load_dinov2_pretrained(model):
-    *_, url = DINOV2_VARIANTS[model.variant]
-    state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
+    source = DINOV2_VARIANTS[model.variant][6]
+    if model.rope is None:
+        state = torch.hub.load_state_dict_from_url(source, progress=False, map_location="cpu")
+        model.load_state_dict(state, strict=True)
+        return model
+    # DINOv3: same block internals under different names, and no mask_token in the checkpoint.
+    from huggingface_hub import hf_hub_download
+
+    state = torch.load(hf_hub_download(source, "pytorch_model.bin"), map_location="cpu", weights_only=True)
+    state = {k.replace("gamma_1", "ls1.gamma").replace("gamma_2", "ls2.gamma"): v for k, v in state.items()}
+    state["register_tokens"] = state.pop("reg_token")
+    state["mask_token"] = model.mask_token.detach().clone()
     model.load_state_dict(state, strict=True)
     return model
 

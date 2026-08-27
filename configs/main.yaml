@@ -26,8 +26,12 @@ data:
   color_jitter_saturation: 0.30
   hed_jitter: 0.07
   tissue_thresh: 0.0
+  curated_index: null # path to curation/cluster.py's curated_idx.npy; null trains on a random draw from the full pool
 model:
   type: dinov2_vits14_reg
+  probe_layers: [5, 7, 9, 12] # 1-indexed blocks whose CLS the classification probes concatenate
+  probe_seg: dense # segmentation features: dense (last 4 blocks, guided 32x32) | plain (final block, 16x16)
+  probe_pool: cls # per-layer classification vector: cls | cls+patch | cls+reg | cls+patch+reg
 train:
   seed: 12
   bf16: true
@@ -61,6 +65,9 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  sigreg_loss_weight: 0.0 # LeJEPA SIGReg isotropic-Gaussian regulariser on CLS; 0 disables
+  sigreg_slices: 64 # random 1-D projections the multivariate Gaussian test is sketched into
+  sigreg_quad: 17 # trapezoid points over t in [-5, 5] for the Epps-Pulley integral
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4
