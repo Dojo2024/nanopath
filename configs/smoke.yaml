@@ -20,6 +20,7 @@ data:
   hed_jitter: 0.06
   tissue_thresh: 0.0
   curated_index: null # 0 disables tissue rejection; >0 requires this saturated-pixel fraction
+  stratify_batches: true # one tile per top-level curation cluster per batch; false = plain shuffle over the curated subset
 
 model:
   type: dinov2_vits14_reg

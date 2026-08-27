@@ -27,6 +27,7 @@ data:
   hed_jitter: 0.07
   tissue_thresh: 0.0
   curated_index: null # path to curation/cluster.py's curated_idx.npy; null trains on a random draw from the full pool
+  stratify_batches: true # one tile per top-level curation cluster per batch; false = plain shuffle over the curated subset
 model:
   type: dinov2_vits14_reg
   probe_layers: [5, 7, 9, 12] # 1-indexed blocks whose CLS the classification probes concatenate

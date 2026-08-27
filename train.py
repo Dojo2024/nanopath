@@ -416,10 +416,15 @@ def main():
     # F-BR 79.9), while curating with it wins (T1-BS 82.0) -- because a heavy-tailed pool otherwise
     # lets a few dense morphologies dominate every gradient step.
     train_sampler = None
-    if train_ds.cluster_of is not None:
+    if train_ds.cluster_of is not None and cfg["data"]["stratify_batches"]:
         rng = np.random.default_rng(int(train_cfg["seed"]))
         queues = [rng.permutation(np.nonzero(train_ds.cluster_of == c)[0]) for c in np.unique(train_ds.cluster_of)]
-        train_sampler = [int(q[i]) for i in range(max(len(q) for q in queues)) for q in queues if i < len(q)]
+        # Clusters are unequal after curation, so a cluster shorter than the longest recycles through
+        # its own shuffled order rather than dropping out. That keeps every batch exactly one-tile-
+        # per-cluster for the whole run and spends the full sample budget; it is also the paper's own
+        # scheme, which resamples the least-observed tiles so rare morphologies are seen many times.
+        rounds = max(len(q) for q in queues)
+        train_sampler = [int(q[i % len(q)]) for i in range(rounds) for q in queues]
     train_loader = DataLoader(train_ds, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
