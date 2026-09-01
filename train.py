@@ -175,6 +175,22 @@ def sigreg_loss(x, slices, quad):
     return torch.trapezoid((real ** 2 + imag ** 2) * torch.exp(-t[:, None] ** 2 / 2), t, dim=0).mean()
 
 
+# Fourier self-supervision CLS allocation (arXiv:2608.08963 Secs. 4.2-4.3). The paper reserves the
+# left half of the embedding for low frequencies and the right half for high, then contrasts a band
+# view over only the leading slice of its half -- sized by how much of the spectrum that view kept.
+# A hard low-pass (frac -> 0) leaves almost nothing to encode and gets a sliver of dimensions; a
+# permissive one (frac -> 1) earns the full half. High-pass runs the other way: the more low
+# frequencies were stripped, the smaller its slice off the right end. Zeroing the complement (rather
+# than indexing) keeps one shared DINO head for every slice width, and the masked entries take no
+# gradient, so a dimension is only ever trained by the bands that own it.
+def fourier_slice(frac, kind, dim):
+    half = dim // 2
+    ar = torch.arange(dim, device=frac.device)
+    low = ar[None] < (frac * half).ceil().clamp(min=1)[:, None]
+    high = ar[None] >= dim - ((1 - frac) * half).ceil().clamp(min=1)[:, None]
+    return torch.where(kind[:, None].bool(), low, high)
+
+
 # KDE uniformity loss on L2-normalised CLS tokens.
 def kde_loss(x, concentration):
     x = F.normalize(x, p=2, dim=-1)
@@ -250,6 +266,14 @@ def main():
     # FINO metadata-guidance: select factors + signs (float; + encourage M+ / - suppress M-). fino_meta (built or
     # copied beside the dataset by prepare.py) holds per-factor barcode maps + cardinalities (n) / vector dims.
     fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
+    # Fourier self-supervision. `mode` picks which bands the dataloader emits; the per-band weights
+    # scale that band's DINO term (the paper's alpha_low / alpha_high) and 0 mutes a band without
+    # changing the views, so mode=both with one weight zeroed isolates a band at fixed data cost.
+    fourier_cfg = cfg.get("fourier") or {"mode": "off"}
+    fourier_weight = {"low": [fourier_cfg.get("weight_low", 0.1)], "high": [fourier_cfg.get("weight_high", 0.1)],
+                      "both": [fourier_cfg.get("weight_low", 0.1), fourier_cfg.get("weight_high", 0.1)],
+                      "off": []}[fourier_cfg["mode"]]
+    fourier_cfg.setdefault("slice", True)
     fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
     fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
     fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
@@ -478,9 +502,9 @@ def main():
             "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
         }
 
-    # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
+    # Compute (dino_loss, jepa_loss, kde, meta_loss, fourier_loss) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None, fourier=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
@@ -506,6 +530,24 @@ def main():
         # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing
         # factors masked. Discrete: L2-normed student CLS vs EMA prototype bank (clone-rebind keeps the backward-saved
         # bank valid). Continuous: an MLP regresses the z-scored value.
+        # Fourier self-supervision: student-only global views reconstructed from a single Fourier band
+        # of the first global crop, self-distilled against the teacher's CLS for that same crop. Both
+        # sides are masked to the band's slice before the head (the paper contrasts z_i|d against
+        # z'_i|d, not against the full vector), so the term teaches *where* in the embedding a
+        # frequency band belongs rather than only adding a filtered augmentation. Teacher targets are
+        # Sinkhorn-centred per band, keeping each band's assignment balanced within itself instead of
+        # forcing low and high views onto disjoint prototypes.
+        fourier_loss = sg["x_norm_clstoken"].new_zeros(())
+        if fourier is not None:
+            fv, frac, kind, weight = fourier
+            n_f = fv.shape[0] // b
+            m = fourier_slice(frac, kind, student_backbone.embed_dim) if fourier_cfg["slice"] else True
+            sf = student_backbone(fv, checkpoint=ckpt)["x_norm_clstoken"] * m
+            with torch.no_grad():
+                th = teacher_dino_head(t["x_norm_clstoken"][:b].repeat(n_f, 1) * m)
+                tgt = torch.cat([sinkhorn(c, t_temp) for c in th.chunk(n_f)])
+            ce = -(tgt * F.log_softmax(student_dino_head(sf) / 0.1, dim=-1)).sum(-1)
+            fourier_loss = (ce * weight).mean()
         meta_loss = sg["x_norm_clstoken"].new_zeros(())
         if meta is not None:
             gamma, md, mc = meta  # md (B,n_disc) int64 (-1 missing); mc {factor: (B,dim) float, nan missing}
@@ -542,7 +584,7 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, fourier_loss
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -563,7 +605,7 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v, _, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -674,11 +716,20 @@ def main():
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
                     cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
+                    # Band views are flattened view-major to match the global-crop layout, and each
+                    # carries the cutoff fraction and band id that size its CLS slice.
+                    fourier = None
+                    if fourier_weight:
+                        fv = batch["fourier_views"].transpose(0, 1).flatten(0, 1).to(device, non_blocking=True)
+                        fourier = (fv,
+                                   batch["fourier_frac"].t().flatten().to(device, non_blocking=True),
+                                   batch["fourier_kind"].t().flatten().to(device, non_blocking=True),
+                                   torch.tensor(fourier_weight, device=device).repeat_interleave(batch_size))
+                    dino_loss_value, jepa_loss, kde, meta_loss, fourier_loss = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond,
+                        ckpt=activation_checkpointing, meta=meta, cond=cond, fourier=fourier,
                     )
-                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss
+                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss + fourier_loss
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
@@ -705,6 +756,7 @@ def main():
                 reduced = {
                     "dino": float(dino_loss_value.detach()),
                     "jepa": float(jepa_loss.detach()),
+                    "fourier": float(fourier_loss.detach()),
                     "kde": float(kde.detach()),
                     "total": float(total_loss.detach()),
                 }

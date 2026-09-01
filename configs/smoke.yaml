@@ -106,3 +106,17 @@ probe:
     pathorob: /data/pathorob
     surgen: /data/surgen
     ucla_lung: /data/ucla-lung
+fourier:
+  # Fourier self-supervision (arXiv:2608.08963). off reproduces the branch exactly.
+  mode: "off" # off | low | high | both -- which bands become extra student-only global views
+  weight_low: 0.1 # alpha_low: weight on the low-pass band's DINO term
+  weight_high: 0.1 # alpha_high: weight on the high-pass band's term
+  # T_l / T_h, the spectral support each band is drawn from. fourier/calibrate.py measured the paper's
+  # SNR curve on TCGA tiles: 15 dB -> 6, 20 dB -> 29, 25 dB -> 56. H&E spectra are far more
+  # low-frequency-dominated than the paper's natural images (CUB reaches 15 dB only at 23), so
+  # matching their SNR *label* would put us at cutoff 6, a regime they never tested. 29 instead
+  # matches the spectral support they actually operated at. Sweeping these is the paper's Table 5d.
+  cutoff_low: 29
+  cutoff_high: 29
+  slice: true # allocate CLS dims by band; false contrasts on the full CLS (augmentation-only control)
+  blur: true # Gaussian k=5 before filtering, to damp Gibbs ringing at tile edges

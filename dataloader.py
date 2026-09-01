@@ -65,6 +65,21 @@ def patient_id_from_relpath(rel):
     return "-".join(rel.split("/", 1)[0].split("-")[:3])
 
 
+# Fourier band reconstruction (arXiv:2608.08963 Sec. 4). `cutoff` is the square box half-width on
+# the centred spectrum, matching the paper's H_LP(u,v)=1(|u|<f, |v|<f); `low=False` takes the
+# complement. A high-pass reconstruction is zero-mean and signed, so it is re-centred to 0.5 to land
+# in the same range a real tile occupies before Normalize -- this is how the paper renders them
+# (Fig. 10) and keeps the view in-distribution for the DINOv2-initialised patch_embed.
+def fourier_band(x, cutoff, low):
+    spec = torch.fft.fftshift(torch.fft.fft2(x), dim=(-2, -1))
+    h, w = x.shape[-2:]
+    keep_u = (torch.arange(h) - h // 2).abs() < cutoff
+    keep_v = (torch.arange(w) - w // 2).abs() < cutoff
+    box = keep_u[:, None] & keep_v[None, :]
+    out = torch.fft.ifft2(torch.fft.ifftshift(spec * (box if low else ~box), dim=(-2, -1))).real
+    return out.clamp(0.0, 1.0) if low else (out + 0.5).clamp(0.0, 1.0)
+
+
 # Lightweight stain-space jitter; this is the stain augmentation hook for pretraining tiles.
 class HEDJitter(nn.Module):
     # Store conversion matrices as buffers so transforms move with the module dtype/device if needed.
@@ -159,8 +174,10 @@ class TCGATileDataset(Dataset):
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
         self.to_tensor = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
-        # Global crops carry the high-context view used by the DINO/iBOT objectives.
-        self.global_aug = v2.Compose(
+        # Global crops carry the high-context view used by the DINO/iBOT objectives. Split at the
+        # Normalize so the Fourier views below can band-filter the same crop in [0, 1] space before
+        # it is standardised; composing the two halves back together is the original pipeline exactly.
+        self.global_geom = v2.Compose(
             [
                 v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True),
                 *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
@@ -169,9 +186,19 @@ class TCGATileDataset(Dataset):
                 v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),
                 v2.RandomGrayscale(p=0.1),
                 v2.RandomApply([v2.GaussianBlur(9, sigma=(0.1, 1.8))], p=0.35),
-                v2.Normalize(mean=mean, std=std),
             ]
         )
+        self.global_norm = v2.Normalize(mean=mean, std=std)
+        self.global_aug = v2.Compose([self.global_geom, self.global_norm])
+        # Fourier self-supervision (arXiv:2608.08963): extra student-only global views reconstructed
+        # from one Fourier band of an existing crop. `kinds` is the per-view band (1 = low-pass,
+        # 0 = high-pass); the cutoff is redrawn per view per tile, and its position within [1, T] is
+        # returned so train.py can size the CLS slice that view is contrasted on.
+        fourier = cfg.get("fourier") or {}
+        self.fourier_mode = fourier.get("mode", "off") if is_train else "off"
+        self.fourier_kinds = {"off": [], "low": [1], "high": [0], "both": [1, 0]}[self.fourier_mode]
+        self.fourier_cutoff = (int(fourier.get("cutoff_high", 23)), int(fourier.get("cutoff_low", 23)))
+        self.fourier_blur = v2.GaussianBlur(5) if fourier.get("blur", True) else nn.Identity()
         # Local crops force the encoder to align small tissue regions with the global context.
         self.local_aug = v2.Compose(
             [
@@ -221,8 +248,23 @@ class TCGATileDataset(Dataset):
         slide_key = int.from_bytes(hashlib.blake2b(slide_stem.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
-        global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
+        crops = [self.global_geom(tile) for _ in range(self.global_views)]
+        global_views = torch.stack([self.global_norm(c) for c in crops])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        # Band views reconstruct the FIRST global crop, so each is a true positive of a view the
+        # teacher actually sees rather than an independently sampled region. A Gaussian pre-blur
+        # damps the Gibbs ringing a hard spectral box would otherwise leave at tile edges.
+        fourier_keys = {}
+        if self.fourier_kinds:
+            blurred = self.fourier_blur(crops[0])
+            cuts = [random.randint(1, self.fourier_cutoff[k]) for k in self.fourier_kinds]
+            fourier_keys["fourier_views"] = torch.stack([
+                self.global_norm(fourier_band(blurred, c, bool(k))) for c, k in zip(cuts, self.fourier_kinds)
+            ])
+            fourier_keys["fourier_frac"] = torch.tensor(
+                [c / self.fourier_cutoff[k] for c, k in zip(cuts, self.fourier_kinds)], dtype=torch.float32
+            )
+            fourier_keys["fourier_kind"] = torch.tensor(self.fourier_kinds, dtype=torch.int64)
         # FINO per-factor labels for this tile's patient: discrete ids (-1 = missing), one tensor per continuous
         # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
         fino_keys = {}
@@ -238,5 +280,6 @@ class TCGATileDataset(Dataset):
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            **fourier_keys,
             **fino_keys,
         }
