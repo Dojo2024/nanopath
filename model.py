@@ -193,6 +193,24 @@ def load_pretrained(model):
 # DINO/iBOT projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
+# I-JEPA predictor: a shallow ViT over the student's patch tokens that predicts the teacher's
+# layer-normed patch features at the masked block positions.
+class JEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, patch_tokens):
+        x = self.proj_in(patch_tokens)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.proj(self.norm(x))
+
+
 class DINOHead(nn.Module):
     def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3):
         super().__init__()

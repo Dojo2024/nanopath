@@ -41,14 +41,14 @@ train:
   global_views: 2
   local_views: 8
   global_size: 224
-  local_size: 98
+  local_size: 112
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
 
 dino:
   lr: 1.0e-4
   lr_min: 1.0e-6
-  adam_beta2: 0.99
-  warmup_fraction: 0.03
+  adam_beta2: 0.999
+  warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
   patch_embed_lr_mult: 0.2
@@ -58,6 +58,13 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  jepa_pred_depth: 4     # I-JEPA predictor blocks
+  jepa_pred_width: 0     # 0 = same width as the backbone
+  jepa_blocks: 4         # contiguous square target blocks per image
+  jepa_block_scale: 0.10 # fraction of the patch grid each block covers
+  # Schedules key to FLOP progress by default, which never completes on a sample-bound run.
+  # "lr_only" keys the LR decay to sample progress so it anneals; "all" re-keys wd/teacher/kde/ema.
+  schedule_key: lr_only
 
 probe:
   enabled: true

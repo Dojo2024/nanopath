@@ -7,8 +7,9 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --account=sophont
-#SBATCH --qos=high
+#SBATCH --account=training
+#SBATCH --qos=normal
+#SBATCH --exclude=n-1,n-4,n-5,n-8  # low-memory co-tenant nodes; re-check before each submit
 
 set -euo pipefail
 
