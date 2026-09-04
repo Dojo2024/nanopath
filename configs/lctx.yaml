@@ -1,0 +1,119 @@
+project:
+  name: nanopath-lctx14
+  family: nanopath
+  recipe_id: dinov2-vits14-reg-kde
+  output_dir: /data/$USER/nanopath/main/nanopath-lctx14
+  wandb_dir: /data/$USER/nanopath/wandb
+
+data:
+  # dataset_dir holds the parquet shards (shard-NNNNN.parquet) that train.py reads.
+  # `prepare.py … download=True` populates it from the medarc/nanopath training mirror.
+  dataset_dir: /data/nanopath_parquet
+  split_seed: 7777
+  val_fraction: 0.05
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  global_crop_scale: [0.4, 1.0]
+  local_crop_scale: [0.08, 0.35]
+  color_jitter: 0.3
+  color_jitter_saturation: 0.25
+  hed_jitter: 0.06
+  tissue_thresh: 0.0 # v1 reference trained on the unfiltered pool
+
+model:
+  type: dinov2_vits14_reg
+
+train:
+  seed: 7777
+  bf16: true
+  activation_checkpointing: false
+  batch_size: 128
+  num_workers: 16
+  prefetch_factor: 2
+  persistent_workers: true
+  max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
+  max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
+  log_every: 20
+  save_every: 1000
+  # Validation pass every `eval_every` steps over `val_batches` held-out batches
+  eval_every: 200
+  val_batches: 16
+  global_views: 2
+  local_views: 14
+  global_size: 224
+  local_size: 128
+  resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
+
+dino:
+  lr: 1.0e-4
+  lr_min: 1.0e-6
+  adam_beta2: 0.999
+  warmup_fraction: 0.0909
+  freeze_last_layer_fraction: 0.0091
+  layerwise_decay: 0.7
+  patch_embed_lr_mult: 0.2
+  drop_path_rate: 0.1
+  head_hidden_dim: 2048
+  head_bottleneck_dim: 384
+  clip_grad: 3.0
+  kde_loss_weight: 0.005
+  kde_concentration: 10.0
+  jepa_pred_depth: 4     # I-JEPA predictor blocks
+  jepa_pred_width: 0     # 0 = same width as the backbone
+  jepa_blocks: 4         # contiguous square target blocks per image
+  jepa_block_scale: 0.10 # fraction of the patch grid each block covers
+  # Schedules key to FLOP progress by default, which never completes on a sample-bound run.
+  # "lr_only" keys the LR decay to sample progress so it anneals; "all" re-keys wd/teacher/kde/ema.
+  schedule_key: lr_only
+
+probe:
+  enabled: true
+  model_weights: ema
+  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
+  datasets:
+    - bach
+    - bracs
+    - break_his
+    - crc
+    - esca
+    - mhist
+    - pcam
+    - spider_breast
+    - spider_colorectal
+    - spider_skin
+    - spider_thorax
+    - wilds
+  segmentation_datasets:
+    - pannuke
+    - segpath_epithelial
+    - segpath_lymphocytes
+  slide_datasets:
+    - ucla_lung
+  auc_datasets:
+    - surgen
+  survival_datasets:
+    - leopard_bcr
+    - cptac_pda_os
+  robustness_datasets:
+    - pathorob
+  dataset_roots:
+    bach: /data/thunder-data/bach
+    bracs: /data/thunder-data/bracs
+    break_his: /data/thunder-data/break_his
+    crc: /data/thunder-data/crc
+    esca: /data/thunder-data/esca
+    mhist: /data/thunder-data/mhist
+    pcam: /data/thunder-data/patch_camelyon
+    spider_breast: /data/thunder-data/spider_breast
+    spider_colorectal: /data/thunder-data/spider_colorectal
+    spider_skin: /data/thunder-data/spider_skin
+    spider_thorax: /data/thunder-data/spider_thorax
+    wilds: /data/thunder-data/wilds
+    pannuke: /data/thunder-data/pannuke
+    segpath_epithelial: /data/thunder-data/segpath_epithelial
+    segpath_lymphocytes: /data/thunder-data/segpath_lymphocytes
+    cptac_pda_os: /data/CPTAC-PDA
+    leopard_bcr: /data/leopard_bcr
+    pathorob: /data/pathorob
+    surgen: /data/surgen
+    ucla_lung: /data/ucla-lung
