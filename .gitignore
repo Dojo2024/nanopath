@@ -54,3 +54,4 @@ core.*
 # prepare.py download=True rewrites absent /data + /block roots to nanopath/data/.
 data/
 preserved_run_logs/
+.venv
