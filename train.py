@@ -433,9 +433,17 @@ def main():
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         # I-JEPA: regress the teacher's layer-normed patch features at the masked block positions.
-        target = F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
+        # data2vec-2.0 multi-mask: the teacher forward is reused across jepa_mask_passes independent
+        # masks of the same tiles, so extra supervision costs student passes only. Masks are not tile
+        # presentations, so this spends idle FLOP budget without touching the 1M-tile cap.
+        target = F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))
         pred = student_predictor(sg["patches"]).flatten(0, 1)[mask_idx]
-        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        jepa_loss = F.smooth_l1_loss(pred, target[mask_idx], reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        for _ in range(dino_cfg["jepa_mask_passes"] - 1):
+            m2, mi2, mw2 = make_block_mask(b * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"]))
+            p2 = student_predictor(student_backbone(gf, masks=m2, checkpoint=ckpt)["patches"]).flatten(0, 1)[mi2]
+            jepa_loss = jepa_loss + F.smooth_l1_loss(p2, target[mi2], reduction="none").mean(-1).mul(mw2).sum() / max(1, b * 2)
+        jepa_loss = jepa_loss / dino_cfg["jepa_mask_passes"]
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["cls"].chunk(train_cfg["global_views"]))
         return local_loss + global_loss, jepa_loss, kde
 

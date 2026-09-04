@@ -1,8 +1,8 @@
 project:
-  name: main-dinov2
+  name: nanopath-mm2
   family: nanopath
   recipe_id: dinov2-vits14-reg-kde
-  output_dir: /data/$USER/nanopath/main/default
+  output_dir: /data/$USER/nanopath/main/nanopath-mm2
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -60,7 +60,7 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4     # I-JEPA predictor blocks
   jepa_pred_width: 0     # 0 = same width as the backbone
-  jepa_mask_passes: 1 # data2vec-2.0 multi-mask: student passes per teacher forward
+  jepa_mask_passes: 2 # data2vec-2.0 multi-mask: student passes per teacher forward
   jepa_blocks: 4         # contiguous square target blocks per image
   jepa_block_scale: 0.10 # fraction of the patch grid each block covers
   # Schedules key to FLOP progress by default, which never completes on a sample-bound run.
