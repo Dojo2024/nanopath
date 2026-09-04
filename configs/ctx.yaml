@@ -1,8 +1,8 @@
 project:
-  name: main-dinov2
+  name: nanopath-ctx025
   family: nanopath
   recipe_id: dinov2-vits14-reg-kde
-  output_dir: /data/$USER/nanopath/main/default
+  output_dir: /data/$USER/nanopath/main/nanopath-ctx025
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -61,7 +61,7 @@ dino:
   jepa_pred_depth: 4     # I-JEPA predictor blocks
   jepa_pred_width: 0     # 0 = same width as the backbone
   jepa_blocks: 4         # contiguous square target blocks per image
-  context_loss_weight: 0.0
+  context_loss_weight: 0.25
   jepa_block_scale: 0.10 # fraction of the patch grid each block covers
   # Schedules key to FLOP progress by default, which never completes on a sample-bound run.
   # "lr_only" keys the LR decay to sample progress so it anneals; "all" re-keys wd/teacher/kde/ema.

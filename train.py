@@ -178,7 +178,12 @@ def make_block_mask(batch, grid, device, n_blocks, block_scale):
     masks = masks.flatten(1)
     idx = masks.flatten().nonzero().flatten()
     weights = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
-    return masks, idx, weights
+    # V-JEPA 2.1 context loss: visible patches are supervised too, weighted 1/sqrt(distance
+    # to the nearest masked patch), so continuity is enforced hardest at mask boundaries.
+    coords = torch.cartesian_prod(torch.arange(grid, device=device), torch.arange(grid, device=device)).float()
+    d = torch.where(masks.unsqueeze(1), torch.cdist(coords, coords).unsqueeze(0), torch.inf).amin(-1)
+    w = d.clamp(min=1).rsqrt().mul(~masks)
+    return masks, idx, weights, (~masks).flatten().nonzero().flatten(), (w / w.sum(-1, keepdim=True).clamp(min=1e-6))[~masks]
 
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
@@ -421,7 +426,7 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, vis_idx, vis_w, t_temp, k_scale, ckpt=False):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["cls"]).chunk(train_cfg["global_views"])
@@ -433,9 +438,11 @@ def main():
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         # I-JEPA: regress the teacher's layer-normed patch features at the masked block positions.
-        target = F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
-        pred = student_predictor(sg["patches"]).flatten(0, 1)[mask_idx]
-        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        target = F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))
+        pred = student_predictor(sg["patches"]).flatten(0, 1)
+        jepa_loss = F.smooth_l1_loss(pred[mask_idx], target[mask_idx], reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        if dino_cfg["context_loss_weight"]:
+            jepa_loss = jepa_loss + dino_cfg["context_loss_weight"] * F.smooth_l1_loss(pred[vis_idx], target[vis_idx], reduction="none").mean(-1).mul(vis_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["cls"].chunk(train_cfg["global_views"]))
         return local_loss + global_loss, jepa_loss, kde
 
@@ -457,8 +464,8 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                masks, mask_idx, mask_w, vis_idx, vis_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"]))
+                dino_l, jepa_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, vis_idx, vis_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -551,7 +558,7 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"]))
+            masks, mask_idx, mask_w, vis_idx, vis_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"]))
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -563,7 +570,7 @@ def main():
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
                     dino_loss_value, jepa_loss, kde = compute_losses(
-                        gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
+                        gf, lf, batch_size, masks, mask_idx, mask_w, vis_idx, vis_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing,
                     )
                     total_loss = dino_loss_value + jepa_loss + kde
