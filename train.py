@@ -249,7 +249,8 @@ def main():
     teacher_dino_head = deepcopy(student_dino_head)
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
-    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"])).to(device)
+    target_blocks = tuple(dino_cfg["jepa_target_blocks"])
+    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_targets=len(target_blocks)).to(device)
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
     opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
@@ -428,7 +429,7 @@ def main():
     # schedule values. Used by both the train step and evaluate() (no_grad).
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, vis_idx, vis_w, t_temp, k_scale, ckpt=False):
         with torch.no_grad():
-            t = teacher_backbone(gf)
+            t = teacher_backbone(gf, taps=target_blocks)
             t_cls = teacher_dino_head(t["cls"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
@@ -438,7 +439,9 @@ def main():
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         # I-JEPA: regress the teacher's layer-normed patch features at the masked block positions.
-        target = F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))
+        # Each tapped depth is standardized on its own before concatenation; jointly standardizing
+        # the stack loses the per-depth scale and trains notably worse (Bootleg Tbl 33).
+        target = torch.cat([F.layer_norm(v[:, 1 + student_backbone.registers :].flatten(0, 1), (student_backbone.embed_dim,)) for v in t["tapped"]], dim=-1)
         pred = student_predictor(sg["patches"]).flatten(0, 1)
         jepa_loss = F.smooth_l1_loss(pred[mask_idx], target[mask_idx], reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         if dino_cfg["context_loss_weight"]:

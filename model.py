@@ -159,18 +159,24 @@ class ViT(nn.Module):
     # Return semantic token groups used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
+    # `taps` are 1-indexed block numbers whose full (pre-final-norm) token sequences are also
+    # returned, so one teacher forward can supply JEPA targets at several depths.
+    def forward(self, x, masks=None, checkpoint=False, taps=()):
         x = self._prepare_tokens(x, masks)
-        for blk in self.blocks:
+        cache = {}
+        for i, blk in enumerate(self.blocks, start=1):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if i in set(taps):
+                cache[i] = x
         x = self.norm(x)
         return {
             "cls": x[:, 0],
             "registers": x[:, 1 : 1 + self.registers],
             "patches": x[:, 1 + self.registers :],
+            "tapped": [cache[i] for i in taps],
         }
 
     # Default probe contract: encode_image returns patches for segmentation
@@ -196,13 +202,13 @@ def load_pretrained(model):
 # I-JEPA predictor: a shallow ViT over the student's patch tokens that predicts the teacher's
 # layer-normed patch features at the masked block positions.
 class JEPAPredictor(nn.Module):
-    def __init__(self, dim, depth=4, width=0, heads=6):
+    def __init__(self, dim, depth=4, width=0, heads=6, n_targets=1):
         super().__init__()
         width = width or dim
         self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
         self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
         self.norm = nn.LayerNorm(width, eps=1e-6)
-        self.proj = nn.Linear(width, dim, bias=True)
+        self.proj = nn.Linear(width, dim * n_targets, bias=True)
 
     def forward(self, patch_tokens):
         x = self.proj_in(patch_tokens)

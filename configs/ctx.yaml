@@ -61,6 +61,7 @@ dino:
   jepa_pred_depth: 4     # I-JEPA predictor blocks
   jepa_pred_width: 0     # 0 = same width as the backbone
   jepa_blocks: 4         # contiguous square target blocks per image
+  jepa_target_blocks: [12] # 1-indexed teacher blocks the predictor regresses; [12] = final block only
   context_loss_weight: 0.25
   jepa_block_scale: 0.10 # fraction of the patch grid each block covers
   # Schedules key to FLOP progress by default, which never completes on a sample-bound run.
