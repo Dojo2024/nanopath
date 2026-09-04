@@ -109,8 +109,10 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
+        shard_sizes = []
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
+            shard_sizes.append(len(paths))
             for row_idx, p in enumerate(paths):
                 # XOR with is_train: training keeps tiles where patient_in_val is False,
                 # validation keeps the complement.
@@ -122,6 +124,18 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # Tile-level curation (curation/cluster.py): restrict training to the balanced subset sampled
+        # from a hierarchical k-means tree over frozen-DINOv2 tile embeddings, and carry each kept
+        # tile's top-level cluster id so train.py can stratify batches over the tree. The run is
+        # sample-bound at 1M presentations out of a ~4M pool, so *which* 1M we spend is a free lever.
+        self.cluster_of = None
+        if data["curated_index"] and is_train:
+            gid = np.concatenate([[0], np.cumsum(shard_sizes)])[:-1][self.shard_of] + self.row_of
+            keep = np.load(data["curated_index"])
+            pos = np.searchsorted(gid, keep)
+            assert np.array_equal(gid[pos], keep), "curated index does not match this train split"
+            self.shard_of, self.row_of = self.shard_of[pos], self.row_of[pos]
+            self.cluster_of = np.load(Path(data["curated_index"]).with_name("curated_top.npy"))
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])

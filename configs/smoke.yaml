@@ -19,6 +19,10 @@ data:
   color_jitter_saturation: 0.4
   hed_jitter: 0.12
   tissue_thresh: 0.5 # training rejects tiles unless this fraction of pixels has RGB saturation > 0.07
+  # Tile curation: path to curated_idx.npy from curation/cluster.py (null = train on the full pool).
+  # curated_top.npy must sit beside it. stratify_batches round-robins batches over the top clusters.
+  curated_index: /data/$USER/nanopath/curation/curated_idx.npy
+  stratify_batches: true
 
 model:
   type: dinov2_vits14_reg

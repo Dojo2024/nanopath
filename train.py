@@ -367,7 +367,19 @@ def main():
         "prefetch_factor": train_cfg["prefetch_factor"] if train_cfg["num_workers"] > 0 else None,
         "persistent_workers": train_cfg["persistent_workers"] and train_cfg["num_workers"] > 0,
     }
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    # Batch stratification: round-robin over top-level curation clusters so each batch of
+    # `batch_size` holds one tile per cluster. The curation paper finds this is the component that
+    # decides the outcome -- curating without it scores *below* uncurated training, while curating
+    # with it wins -- because a heavy-tailed pool otherwise lets a few dense morphologies dominate
+    # every gradient step. Clusters are unequal after curation, so a short cluster recycles through
+    # its own shuffled order rather than dropping out, keeping every batch one-tile-per-cluster.
+    train_sampler = None
+    if train_ds.cluster_of is not None and cfg["data"]["stratify_batches"]:
+        rng = np.random.default_rng(int(train_cfg["seed"]))
+        queues = [rng.permutation(np.nonzero(train_ds.cluster_of == c)[0]) for c in np.unique(train_ds.cluster_of)]
+        rounds = max(len(q) for q in queues)
+        train_sampler = [int(q[i % len(q)]) for i in range(rounds) for q in queues]
+    train_loader = DataLoader(train_ds, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
