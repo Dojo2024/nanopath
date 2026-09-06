@@ -184,6 +184,10 @@ class TCGATileDataset(Dataset):
         patient_id = patient_id_from_relpath(rel)
         slide_key = int.from_bytes(hashlib.blake2b(slide_stem.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
+        # TCGA tissue-source-site code (2nd barcode field) is a free per-slide centre label at train
+        # time; hashed the same way as slide/patient so equality checks (train.py's xsite queue) need
+        # no vocabulary and unseen sites just work.
+        site_key = int.from_bytes(hashlib.blake2b(slide_stem.split("-")[1].encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         fino = {}
         if self.fino:
             fino["meta_disc"] = torch.tensor([self.meta_disc[factor].get(patient_id, -1) for factor in self.fino_disc], dtype=torch.int64)
@@ -199,5 +203,6 @@ class TCGATileDataset(Dataset):
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            "site_id": torch.tensor(site_key, dtype=torch.int64),
             **fino,
         }

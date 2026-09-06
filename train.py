@@ -270,6 +270,16 @@ def main():
         for p in module.parameters():
             p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
+    # Idea A3: cross-site NNCLR pull -- a FIFO queue of recent teacher CLS vectors (with their site
+    # ids) that the student's own CLS is pulled toward its nearest *other-site* neighbour. Off when
+    # xsite_weight is 0, which leaves the base recipe bit-identical.
+    xsite_weight = float(dino_cfg.get("xsite_weight", 0.0))
+    xsite_queue_size = int(dino_cfg.get("xsite_queue_size", 8192))
+    xsite_queue_feat = xsite_queue_site = xsite_ptr = None
+    if xsite_weight:
+        xsite_queue_feat = F.normalize(torch.randn(xsite_queue_size, student_backbone.embed_dim, device=device), dim=-1)
+        xsite_queue_site = torch.full((xsite_queue_size,), -1, dtype=torch.int64, device=device)
+        xsite_ptr = [0]
     predictors = {
         factor: nn.Sequential(nn.Linear(student_backbone.embed_dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU(), nn.Linear(256, fino_meta["cont_dim"].get(factor, 1))).to(device)
         for factor, _ in fino_cont
@@ -464,7 +474,7 @@ def main():
         }
 
     # Compute DINO, the configured patch objective, KDE, and optional FINO; validation omits FINO.
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, site=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["cls"]).chunk(train_cfg["global_views"])
@@ -512,7 +522,26 @@ def main():
                     if keep.any():
                         prediction = predictors[factor](GradScale.apply(student_cls[keep], sign * gamma))
                         meta_loss = meta_loss + 0.03 * F.mse_loss(prediction, values[keep])
-        return local_loss + global_loss, patch_loss, kde, meta_loss
+        aux_loss = sg["cls"].new_zeros(())
+        if xsite_weight and site is not None:
+            with torch.no_grad():
+                anchor_t = F.normalize(t["cls"][:b].float(), dim=-1)
+                valid = xsite_queue_site >= 0
+                sim = anchor_t @ xsite_queue_feat.t()
+                other_site = site.unsqueeze(1) != xsite_queue_site.unsqueeze(0)
+                sim = sim.masked_fill(~(valid.unsqueeze(0) & other_site), -2.0)
+                has_nn = (sim > -1.5).any(dim=1)
+                nn_target = xsite_queue_feat[sim.argmax(dim=1)]
+            anchor_s = F.normalize(sg["cls"][:b].float(), dim=-1)
+            per_sample = 1.0 - (anchor_s * nn_target).sum(-1)
+            aux_loss = aux_loss + xsite_weight * (per_sample * has_nn).sum() / has_nn.sum().clamp_min(1)
+            with torch.no_grad():
+                n = min(b, xsite_queue_size)
+                idx = (xsite_ptr[0] + torch.arange(n, device=anchor_t.device)) % xsite_queue_size
+                xsite_queue_feat[idx] = anchor_t[:n]
+                xsite_queue_site[idx] = site[:n]
+                xsite_ptr[0] = (xsite_ptr[0] + n) % xsite_queue_size
+        return local_loss + global_loss, patch_loss, kde, meta_loss, aux_loss
 
     # Held-out validation pass: same DINO + patch + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -534,7 +563,7 @@ def main():
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = (make_block_mask(b * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"])) if robust_norm else
                                            make_masks(b * train_cfg["global_views"], global_patches, device))
-                dino_l, patch_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, patch_l, kde_v, _, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(patch_l), float(kde_v), float(dino_l + patch_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -636,11 +665,12 @@ def main():
                     gamma = fino_cfg["gamma_max"] * (2 / (1 + math.exp(-10 * sample_fraction)) - 1) if fino_cfg else 0.0
                     meta = ((gamma, batch["meta_disc"].to(device, non_blocking=True),
                              {factor: batch[f"mc_{factor}"].to(device, non_blocking=True) for factor, _ in fino_cont}) if fino_cfg else None)
-                    dino_loss_value, patch_loss, kde, meta_loss = compute_losses(
+                    dino_loss_value, patch_loss, kde, meta_loss, aux_loss = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta,
+                        site=batch["site_id"].to(device, non_blocking=True) if xsite_weight else None,
                     )
-                    total_loss = dino_loss_value + patch_loss + kde
+                    total_loss = dino_loss_value + patch_loss + kde + aux_loss
                     if meta_loss is not None:
                         total_loss = total_loss + meta_loss
                 opt.zero_grad(set_to_none=True)
@@ -669,6 +699,7 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     patch_name: float(patch_loss.detach()),
                     "kde": float(kde.detach()),
+                    "aux": float(aux_loss.detach()),
                     "total": float(total_loss.detach()),
                 }
                 unique_counts = flush_unique_counts()
@@ -725,7 +756,7 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  {patch_name}: {reduced[patch_name]:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  {patch_name}: {reduced[patch_name]:.4f}  kde: {reduced['kde']:.4f}  aux: {reduced['aux']:.4f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -853,6 +884,8 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
+        "xsite_weight": xsite_weight,
+        "xsite_queue_size": xsite_queue_size,
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
