@@ -37,6 +37,7 @@ FULL_RUN_MAX_SAMPLES = 1_000_000
 MAX_REPO_DIFF_BYTES = 120_000
 MAX_REVIEW_FILES_BYTES = 500_000
 MAX_SOURCE_FILE_BYTES = 10_000_000
+MAX_BENCHMARK_FILE_BYTES = 20_000_000
 MAX_GITHUB_TOKEN_FILE_BYTES = 16_384
 REVIEW_DIFF_PATHS = ("train.py", "model.py", "dataloader.py", "prepare.py")
 IGNORED_SOURCE_PATHS = {"AGENTS.md", "CLAUDE.md"}
@@ -381,7 +382,8 @@ def final_metrics(summary: dict[str, Any], rows: list[dict[str, Any]], primary: 
     direct_metrics = {
         "classification_mean_f1", "linear_mean_f1", "knn_mean_f1", "fewshot_mean_f1",
         "seg_mean_f1", "seg_mean_jaccard", "slide_mean_auc", "auc_mean",
-        "survival_mean_cindex", "robustness_mean", "robustness_quality_mean",
+        "survival_mean_cindex", "robustness_mean", "croma_mean", "croma_ltm10_mean",
+        "croma_f0_mean",
     }
     metrics: dict[str, float] = {}
     for key, value in summary.items():
@@ -579,9 +581,10 @@ def snapshot_file(source_dir: Path, path: str) -> bytes | None:
     if not source_path.exists() or not source_path.is_file():
         return None
     size = source_path.stat().st_size
-    if size > MAX_SOURCE_FILE_BYTES:
+    limit = MAX_BENCHMARK_FILE_BYTES if path.startswith("benchmarking/") else MAX_SOURCE_FILE_BYTES
+    if size > limit:
         raise ValueError(
-            f"large file in source snapshot: {path} ({size} bytes > {MAX_SOURCE_FILE_BYTES}); "
+            f"large file in source snapshot: {path} ({size} bytes > {limit}); "
             "keep raw/processed data outside the repo and rerun"
         )
     return source_path.read_bytes()
