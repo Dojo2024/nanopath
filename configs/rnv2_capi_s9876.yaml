@@ -1,0 +1,132 @@
+data:
+  color_jitter: 0.3
+  color_jitter_saturation: 0.3
+  dataset_dir: /data/nanopath_parquet
+  global_crop_scale:
+  - 0.4
+  - 1.0
+  hed_jitter: 0.07
+  local_crop_scale:
+  - 0.08
+  - 0.35
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  split_seed: 7777
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  tissue_thresh: 0.0
+  val_fraction: 0.05
+dino:
+  adam_beta2: 0.999
+  clip_grad: 3.0
+  drop_path_rate: 0.1
+  freeze_last_layer_fraction: 0.0091
+  head_bottleneck_dim: 384
+  head_hidden_dim: 2048
+  jepa_block_scale: 0.1
+  jepa_blocks: 4
+  jepa_pred_depth: 4
+  jepa_pred_width: 0
+  kde_concentration: 10.0
+  kde_loss_weight: 0.1
+  layerwise_decay: 0.7
+  lr: 0.000125
+  lr_min: 1.0e-06
+  patch_embed_lr_mult: 0.2
+  warmup_fraction: 0.0909
+  capi_clusters: 16384
+  capi_weight: 1.0
+fino:
+  continuous:
+  - - expr512
+    - 1
+  - - fga
+    - 1
+  discrete:
+  - - subtype
+    - 1
+  enabled: true
+  gamma_max: 0.7
+model:
+  type: robust_norm_dinov2_vits14_reg
+probe:
+  auc_datasets:
+  - surgen
+  count: 1
+  dataset_roots:
+    bach: /data/thunder-data/bach
+    bracs: /data/thunder-data/bracs
+    break_his: /data/thunder-data/break_his
+    cptac_pda_os: /data/CPTAC-PDA
+    crc: /data/thunder-data/crc
+    esca: /data/thunder-data/esca
+    leopard_bcr: /data/leopard_bcr
+    mhist: /data/thunder-data/mhist
+    pannuke: /data/thunder-data/pannuke
+    pathorob: /data/pathorob
+    pcam: /data/thunder-data/patch_camelyon
+    segpath_epithelial: /data/thunder-data/segpath_epithelial
+    segpath_lymphocytes: /data/thunder-data/segpath_lymphocytes
+    spider_breast: /data/thunder-data/spider_breast
+    spider_colorectal: /data/thunder-data/spider_colorectal
+    spider_skin: /data/thunder-data/spider_skin
+    spider_thorax: /data/thunder-data/spider_thorax
+    surgen: /data/surgen
+    ucla_lung: /data/ucla-lung
+    wilds: /data/thunder-data/wilds
+  datasets:
+  - bach
+  - bracs
+  - break_his
+  - crc
+  - esca
+  - mhist
+  - pcam
+  - spider_breast
+  - spider_colorectal
+  - spider_skin
+  - spider_thorax
+  - wilds
+  enabled: true
+  model_weights: ema
+  robustness_datasets:
+  - pathorob
+  segmentation_datasets:
+  - pannuke
+  - segpath_epithelial
+  - segpath_lymphocytes
+  slide_datasets:
+  - ucla_lung
+  survival_datasets:
+  - leopard_bcr
+  - cptac_pda_os
+project:
+  family: nanopath
+  name: rnv2-capi-s9876
+  output_dir: /data/dojo/nanopath/main/rnv2-capi-s9876
+  recipe_id: dinov2-vits14-reg-jepa-mask10
+  wandb_dir: /data/$USER/nanopath/wandb
+train:
+  activation_checkpointing: false
+  batch_size: 128
+  bf16: true
+  eval_every: 200
+  global_size: 224
+  global_views: 2
+  local_size: 128
+  local_views: 14
+  log_every: 20
+  max_train_flops: 1000000000000000000
+  max_train_samples: 1000000
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 2
+  resume: null
+  robust_norm: true
+  save_every: 1000
+  seed: 9876
+  val_batches: 16

@@ -147,6 +147,27 @@ class TCGATileDataset(Dataset):
         ]
         self.global_aug = v2.Compose([v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True), *augment])
         self.local_aug = v2.Compose([v2.RandomResizedCrop(train["local_size"], scale=tuple(data["local_crop_scale"]), antialias=True), *augment])
+        # Idea A5: a stain-only sibling of global view 0 sharing its EXACT crop (geometry split out of
+        # global_aug's pipeline), so patch i here and patch i in the clean view are the same tissue --
+        # a direct patch-level target for stain invariance. Only built when stain_weight is nonzero.
+        self.stain_view = float(cfg["dino"].get("stain_weight", 0.0)) > 0
+        if self.stain_view:
+            self.stain_geom = v2.Compose([
+                v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True),
+                v2.RandomHorizontalFlip(), v2.RandomVerticalFlip(),
+            ])
+            # Color-only ops (no flips -- geometry is fixed once by stain_geom above so the clean and
+            # strong views stay pixel-aligned).
+            self.stain_color_clean = v2.Compose([
+                *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
+                v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),
+                v2.RandomGrayscale(p=0.1),
+                v2.RandomApply([v2.GaussianBlur(9, sigma=(0.1, 1.8))], p=0.35),
+                v2.Normalize(mean=mean, std=std),
+            ])
+            # Deliberately stronger than the base hed_jitter/color_jitter -- this view's whole job is
+            # to look like a different stain/scanner while showing the identical tissue.
+            self.stain_color_strong = v2.Compose([HEDJitter(0.3), v2.ColorJitter(0.6, 0.6, 0.6, 0.0), v2.Normalize(mean=mean, std=std)])
 
     # Dataset length is the number of tiles in this train/val split.
     def __len__(self):
@@ -184,6 +205,10 @@ class TCGATileDataset(Dataset):
         patient_id = patient_id_from_relpath(rel)
         slide_key = int.from_bytes(hashlib.blake2b(slide_stem.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
+        # TCGA tissue-source-site code (2nd barcode field) is a free per-slide centre label at train
+        # time; hashed the same way as slide/patient so equality checks (train.py's xsite queue /
+        # site_center) need no vocabulary and unseen sites just work.
+        site_key = int.from_bytes(hashlib.blake2b(slide_stem.split("-")[1].encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         fino = {}
         if self.fino:
             fino["meta_disc"] = torch.tensor([self.meta_disc[factor].get(patient_id, -1) for factor in self.fino_disc], dtype=torch.int64)
@@ -191,7 +216,13 @@ class TCGATileDataset(Dataset):
                 value = self.meta_cont[factor].get(patient_id, [float("nan")] * self.cont_dim[factor])
                 fino[f"mc_{factor}"] = torch.tensor(value if isinstance(value, list) else [value], dtype=torch.float32)
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
-        global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
+        if self.stain_view:
+            crop0 = self.stain_geom(tile)
+            rest = [self.global_aug(tile) for _ in range(self.global_views - 1)]
+            global_views = torch.stack([self.stain_color_clean(crop0)] + rest)
+            stain_view = self.stain_color_strong(crop0)
+        else:
+            global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
         return {
             "global_views": global_views,
@@ -199,5 +230,7 @@ class TCGATileDataset(Dataset):
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            "site_id": torch.tensor(site_key, dtype=torch.int64),
+            **({"stain_view": stain_view} if self.stain_view else {}),
             **fino,
         }

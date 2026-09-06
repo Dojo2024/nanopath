@@ -171,6 +171,51 @@ def kde_loss(x, concentration):
     return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
+# Idea 8 (DMT-JEPA, arXiv 2405.17995): replace each masked token's teacher target with a
+# cosine-similarity-weighted mean over its k most similar teacher patches inside a (2w+1)^2 local
+# window. The teacher sees the *unmasked* image, so every neighbour is a real feature; aggregating
+# denoises the regression target and injects local semantics into what is otherwise a per-token
+# regression. Runs under no_grad in the caller, so cost is one similarity map plus 2 sweeps over the
+# window offsets -- no (M, K, D) neighbour tensor is ever materialised.
+def dmt_aggregate(patches, grid, k, window):
+    bv, n, d = patches.shape
+    x = patches.float().view(bv, grid, grid, d)
+    xn = F.normalize(x, dim=-1)
+    offsets = [(dy, dx) for dy in range(-window, window + 1) for dx in range(-window, window + 1)]
+    # For target (i, j) the neighbour is (i + dy, j + dx); dst/src slices below are that shift, and
+    # out-of-grid neighbours keep sim = -2 so topk can never select them.
+    sims = x.new_full((bv, grid, grid, len(offsets)), -2.0)
+    spans = []
+    for j, (dy, dx) in enumerate(offsets):
+        yd, ys = slice(max(0, -dy), grid - max(0, dy)), slice(max(0, dy), grid - max(0, -dy))
+        xd, xs = slice(max(0, -dx), grid - max(0, dx)), slice(max(0, dx), grid - max(0, -dx))
+        spans.append((yd, xd, ys, xs))
+        sims[:, yd, xd, j] = (xn[:, yd, xd] * xn[:, ys, xs]).sum(-1)
+    top_sim, top_idx = sims.topk(min(k, len(offsets)), dim=-1)
+    # Cosine weights, negatives dropped. The (0, 0) offset is always present with sim 1.0, so the
+    # weights can never all be zero and the target stays anchored on the token itself.
+    w = top_sim.clamp_min(0.0).masked_fill(top_sim <= -1.5, 0.0)
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-6)
+    out = torch.zeros_like(x)
+    for j, (yd, xd, ys, xs) in enumerate(spans):
+        wj = (w * (top_idx == j)).sum(-1)
+        out[:, yd, xd] += wj[:, yd, xd].unsqueeze(-1) * x[:, ys, xs]
+    return out.view(bv, n, d).to(patches.dtype)
+
+
+# Idea 9 (SimDINO, arXiv 2502.10385): coding rate R(Z) = 1/2 logdet(I + d/(b*eps^2) Z^T Z) on
+# L2-normalised features. Maximising R is what stops collapse, which is why SimDINO can drop
+# centring, sharpening, the teacher-temperature schedule and KDE outright. Cholesky rather than
+# torch.logdet because I + cZ^TZ is SPD by construction, so it is both cheaper and better
+# conditioned; logdet = 2*sum(log diag L), hence the 1/2 cancels. Divided by d so the knob is a
+# per-dimension weight and stays O(1) against the matching term (pure reparameterisation of gamma).
+def coding_rate(z, eps):
+    z = F.normalize(z.float(), dim=-1)
+    b, d = z.shape
+    m = (z.T @ z) * (d / (b * eps * eps)) + torch.eye(d, device=z.device, dtype=torch.float32)
+    return torch.linalg.cholesky(m).diagonal().log().sum() / d
+
+
 # Sample iBOT masking pattern: per-image bernoulli on whether to mask, then random patch ratio.
 def make_masks(batch, patches, device):
     masks = torch.zeros(batch, patches, dtype=torch.bool, device=device)
@@ -200,13 +245,14 @@ def make_block_mask(batch, grid, device, n_blocks, block_scale):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-def build_param_groups(student_backbone, student_dino_head, student_patch_head, layerwise_decay, patch_embed_lr_mult):
+def build_param_groups(student_backbone, student_dino_head, student_patch_head, layerwise_decay, patch_embed_lr_mult, extra_heads=()):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_patch_head, "patch_head"))
+    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_patch_head, "patch_head"),
+               *((head, "capi_head") for head in extra_heads))
     for module, kind in modules:
         for name, p in module.named_parameters():
             if not p.requires_grad:
@@ -270,12 +316,62 @@ def main():
         for p in module.parameters():
             p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
+    # Idea A3: cross-site NNCLR pull -- a FIFO queue of recent teacher CLS vectors (with their site
+    # ids) that the student's own CLS is pulled toward its nearest *other-site* neighbour.
+    xsite_weight = float(dino_cfg.get("xsite_weight", 0.0))
+    xsite_queue_size = int(dino_cfg.get("xsite_queue_size", 8192))
+    xsite_queue_feat = xsite_queue_site = xsite_ptr = None
+    if xsite_weight:
+        xsite_queue_feat = F.normalize(torch.randn(xsite_queue_size, student_backbone.embed_dim, device=device), dim=-1)
+        xsite_queue_site = torch.full((xsite_queue_size,), -1, dtype=torch.int64, device=device)
+        xsite_ptr = [0]
+    # Idea A4: per-site EMA teacher centering -- subtract a running per-site mean from the teacher
+    # CLS before the DINO head, on a hashed bucket table (no vocabulary needed for unseen sites).
+    site_center = bool(dino_cfg.get("site_center", False))
+    SITE_CENTER_BUCKETS = 256
+    site_center_mu = site_center_seen = None
+    if site_center:
+        site_center_mu = torch.zeros(SITE_CENTER_BUCKETS, student_backbone.embed_dim, device=device)
+        site_center_seen = torch.zeros(SITE_CENTER_BUCKETS, dtype=torch.bool, device=device)
+    # Idea A5: stain-only sibling view (dataloader-side); patch-level cosine pull toward the clean
+    # teacher patches of the same crop.
+    stain_weight = float(dino_cfg.get("stain_weight", 0.0))
+    # Idea 8: neighbour-aggregated masked targets. dmt_k = 0 disables; window is the radius, so
+    # window 3 searches the 7x7 patch neighbourhood around each masked token.
+    dmt_k = int(dino_cfg.get("dmt_k", 0))
+    dmt_window = int(dino_cfg.get("dmt_window", 3))
+    # Idea 9: SimDINO. Replaces the whole CE path (heads, Sinkhorn centring, sharpening, the teacher
+    # temperature schedule) with cosine matching against the raw teacher CLS plus a coding-rate
+    # regulariser, and forces KDE off -- the two are different anti-collapse mechanisms and stacking
+    # them would confound the comparison.
+    simdino = bool(dino_cfg.get("simdino", False))
+    simdino_gamma = float(dino_cfg.get("simdino_gamma", 1.0))
+    simdino_eps = float(dino_cfg.get("simdino_eps", 0.5))
+    # SimDINOv2 regularises the patch tokens as well, and it matters here: JEPA regression onto an EMA
+    # teacher has NO collapse resistance of its own (the teacher tracks the student, so both collapse
+    # together), and SimDINO removes the KDE term that was implicitly holding patches apart. Leaving
+    # this at 0 collapsed the patch features by step ~1000 in 446015 while CLS stayed perfectly healthy.
+    simdino_patch_gamma = float(dino_cfg.get("simdino_patch_gamma", simdino_gamma))
+    # Idea A6 (CAPI, arXiv 2502.08769): predict *cluster assignments* for the masked patches instead
+    # of regressing their features. The JEPA predictor itself is untouched -- a DINOHead-style
+    # clustering head is stacked on its output, and the EMA copy of that head turns teacher patches
+    # into Sinkhorn-balanced soft assignments. Only meaningful under robust_norm; plain iBOT mode
+    # already predicts Sinkhorn cluster targets, so there would be nothing to port.
+    capi_clusters = int(dino_cfg.get("capi_clusters", 0)) if robust_norm else 0
+    capi_weight = float(dino_cfg.get("capi_weight", 1.0))
+    student_capi_head = teacher_capi_head = None
+    if capi_clusters:
+        student_capi_head = DINOHead(student_backbone.embed_dim, capi_clusters, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+        teacher_capi_head = deepcopy(student_capi_head)
+        for p in teacher_capi_head.parameters():
+            p.requires_grad = False
     predictors = {
         factor: nn.Sequential(nn.Linear(student_backbone.embed_dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU(), nn.Linear(256, fino_meta["cont_dim"].get(factor, 1))).to(device)
         for factor, _ in fino_cont
     }
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_patch_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"])
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_patch_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"],
+                                      extra_heads=(student_capi_head,) if capi_clusters else ())
     if predictors:
         param_groups.append({"params": [p for model in predictors.values() for p in model.parameters()], "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
     opt = torch.optim.AdamW(param_groups, lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
@@ -316,6 +412,9 @@ def main():
         student_patch_head.load_state_dict(checkpoint["predictor" if robust_norm else "ibot_head"])
         if teacher_patch_head is not None:
             teacher_patch_head.load_state_dict(checkpoint["ibot_head_ema"])
+        if capi_clusters:
+            student_capi_head.load_state_dict(checkpoint["capi_head"])
+            teacher_capi_head.load_state_dict(checkpoint["capi_head_ema"])
         opt.load_state_dict(checkpoint["opt"])
         if fino_cfg:
             prototypes = {factor: value.to(device) for factor, value in checkpoint["protos"].items()}
@@ -434,6 +533,8 @@ def main():
             return payload
         patch_state = ({"predictor": cpu_state(student_patch_head)} if robust_norm else
                        {"ibot_head": cpu_state(student_patch_head), "ibot_head_ema": cpu_state(teacher_patch_head)})
+        if capi_clusters:
+            patch_state = {**patch_state, "capi_head": cpu_state(student_capi_head), "capi_head_ema": cpu_state(teacher_capi_head)}
         return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), **patch_state,
                 "opt": opt.state_dict(), "examples_seen": examples_seen,
                 "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta,
@@ -464,26 +565,79 @@ def main():
         }
 
     # Compute DINO, the configured patch objective, KDE, and optional FINO; validation omits FINO.
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None):
+    loss_diag = {}
+
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, site=None, stain_x=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
-            t_cls = teacher_dino_head(t["cls"]).chunk(train_cfg["global_views"])
-            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
-            patch_target = (F.layer_norm(t["patches"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx] if robust_norm else
-                            sinkhorn(teacher_patch_head(t["patches"].flatten(0, 1)[mask_idx]), t_temp))
+            head_input = t["cls"]
+            if site_center and site is not None:
+                bucket = site.repeat(train_cfg["global_views"]) % SITE_CENTER_BUCKETS
+                head_input = t["cls"] - site_center_mu[bucket]
+                feat = t["cls"].float()
+                upd = torch.zeros_like(site_center_mu).index_add_(0, bucket, feat)
+                cnt = torch.zeros(SITE_CENTER_BUCKETS, device=feat.device).index_add_(0, bucket, torch.ones_like(feat[:, 0]))
+                seen_now = cnt > 0
+                batch_mean = torch.zeros_like(site_center_mu)
+                batch_mean[seen_now] = upd[seen_now] / cnt[seen_now].unsqueeze(1)
+                first_sight = seen_now & ~site_center_seen
+                site_center_mu[first_sight] = batch_mean[first_sight]
+                resight = seen_now & site_center_seen
+                site_center_mu[resight] = 0.99 * site_center_mu[resight] + 0.01 * batch_mean[resight]
+                site_center_seen[seen_now] = True
+            t_prob = None
+            if not simdino:
+                t_cls = teacher_dino_head(head_input).chunk(train_cfg["global_views"])
+                t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
+            # DMT aggregation feeds the masked-patch target only; the stain view below still pulls
+            # toward the raw teacher patches of its own crop.
+            t_patches = dmt_aggregate(t["patches"], global_grid, dmt_k, dmt_window) if dmt_k else t["patches"]
+            if capi_clusters:
+                patch_target = sinkhorn(teacher_capi_head(F.layer_norm(t_patches.flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]), t_temp)
+            elif robust_norm:
+                patch_target = F.layer_norm(t_patches.flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
+            else:
+                patch_target = sinkhorn(teacher_patch_head(t_patches.flatten(0, 1)[mask_idx]), t_temp)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
-        sg_cls, sl_cls = student_dino_head(sg["cls"]), student_dino_head(sl["cls"])
         L = train_cfg["local_views"]
-        local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
-        global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
+        if simdino:
+            # Same view pairing and same (2L + 2) normalisation as the CE path, so the LR and the
+            # schedules carry over unchanged -- only the per-pair objective differs. head_input, not
+            # t["cls"], so per-site centring (A4) still composes.
+            t_view = F.normalize(head_input.float(), dim=-1).chunk(train_cfg["global_views"])
+            s_g, s_l = F.normalize(sg["cls"].float(), dim=-1), F.normalize(sl["cls"].float(), dim=-1)
+            local_loss = sum((1 - (x * y).sum(-1)).mean() for x in s_l.chunk(L) for y in t_view) / (2 * L + 2)
+            global_loss = (1 - (s_g * torch.cat((t_view[1], t_view[0]))).sum(-1)).mean() * 2 / (2 * L + 2)
+            with torch.autocast(device_type="cuda", enabled=False):
+                cr = coding_rate(sg["cls"], simdino_eps)
+            loss_diag["coding_rate"] = float(cr.detach())
+            global_loss = global_loss - simdino_gamma * cr
+        else:
+            sg_cls, sl_cls = student_dino_head(sg["cls"]), student_dino_head(sl["cls"])
+            local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
+            global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         patch_prediction = (student_patch_head(sg["patches"]).flatten(0, 1)[mask_idx] if robust_norm else
                             student_patch_head(sg["patches"].flatten(0, 1)[mask_idx]))
-        if robust_norm:
+        if capi_clusters:
+            patch_loss = capi_weight * -(patch_target * F.log_softmax(student_capi_head(patch_prediction) / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
+        elif robust_norm:
             patch_loss = F.smooth_l1_loss(patch_prediction, patch_target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         else:
             patch_loss = -(patch_target * F.log_softmax(patch_prediction / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["cls"].chunk(train_cfg["global_views"]))
+        if simdino and simdino_patch_gamma:
+            # Measured on checkpoints (scratchpad/within_image.py): the SimDINO patch failure is
+            # ACROSS-image collapse -- different images map to near-identical mean patch vectors
+            # (cos 0.938 vs baseline 0.319) while within-image diversity stays healthy (0.439 vs
+            # 0.482). A coding rate over flattened tokens is blind to that: within-image variance
+            # keeps it at 0.777 while every image collapses to the same place. So regularise the
+            # per-image mean patch vector, which is the quantity that actually degenerates.
+            with torch.autocast(device_type="cuda", enabled=False):
+                crp = coding_rate(sg["patches"].mean(1), simdino_eps)
+            loss_diag["coding_rate_patch"] = float(crp.detach())
+            patch_loss = patch_loss - simdino_patch_gamma * crp
+        kde = (sg["cls"].new_zeros(()) if simdino else
+               dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["cls"].chunk(train_cfg["global_views"])))
         meta_loss = None
         if meta is not None:
             # FINO uses signed gradient gates on normalized CLS: prototype CE for discrete metadata,
@@ -512,13 +666,37 @@ def main():
                     if keep.any():
                         prediction = predictors[factor](GradScale.apply(student_cls[keep], sign * gamma))
                         meta_loss = meta_loss + 0.03 * F.mse_loss(prediction, values[keep])
-        return local_loss + global_loss, patch_loss, kde, meta_loss
+        aux_loss = sg["cls"].new_zeros(())
+        if xsite_weight and site is not None:
+            with torch.no_grad():
+                anchor_t = F.normalize(t["cls"][:b].float(), dim=-1)
+                valid = xsite_queue_site >= 0
+                sim = anchor_t @ xsite_queue_feat.t()
+                other_site = site.unsqueeze(1) != xsite_queue_site.unsqueeze(0)
+                sim = sim.masked_fill(~(valid.unsqueeze(0) & other_site), -2.0)
+                has_nn = (sim > -1.5).any(dim=1)
+                nn_target = xsite_queue_feat[sim.argmax(dim=1)]
+            anchor_s = F.normalize(sg["cls"][:b].float(), dim=-1)
+            per_sample = 1.0 - (anchor_s * nn_target).sum(-1)
+            aux_loss = aux_loss + xsite_weight * (per_sample * has_nn).sum() / has_nn.sum().clamp_min(1)
+            with torch.no_grad():
+                n = min(b, xsite_queue_size)
+                idx = (xsite_ptr[0] + torch.arange(n, device=anchor_t.device)) % xsite_queue_size
+                xsite_queue_feat[idx] = anchor_t[:n]
+                xsite_queue_site[idx] = site[:n]
+                xsite_ptr[0] = (xsite_ptr[0] + n) % xsite_queue_size
+        if stain_weight and stain_x is not None:
+            sg_stain = student_backbone(stain_x, checkpoint=ckpt)
+            student_p = F.normalize(sg_stain["patches"].float(), dim=-1)
+            teacher_p = F.normalize(t["patches"][:b].float(), dim=-1)
+            aux_loss = aux_loss + stain_weight * (1.0 - (student_p * teacher_p).sum(-1)).mean()
+        return local_loss + global_loss, patch_loss, kde, meta_loss, aux_loss
 
     # Held-out validation pass: same DINO + patch + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
     # diagnostics. RNG is snapshotted/restored so val masks don't perturb the next training step.
     def evaluate(eval_step, eval_teacher_temp, eval_kde_scale):
-        for m in (student_backbone, student_dino_head, student_patch_head):
+        for m in (student_backbone, student_dino_head, student_patch_head, *((student_capi_head,) if capi_clusters else ())):
             m.eval()
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
@@ -534,7 +712,7 @@ def main():
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = (make_block_mask(b * train_cfg["global_views"], global_grid, device, int(dino_cfg["jepa_blocks"]), float(dino_cfg["jepa_block_scale"])) if robust_norm else
                                            make_masks(b * train_cfg["global_views"], global_patches, device))
-                dino_l, patch_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, patch_l, kde_v, _, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(patch_l), float(kde_v), float(dino_l + patch_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -599,6 +777,8 @@ def main():
             student_backbone.train()
             student_dino_head.train()
             student_patch_head.train()
+            if capi_clusters:
+                student_capi_head.train()
             completed_step = step + 1
             should_log = completed_step == 1 or completed_step % train_cfg["log_every"] == 0
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
@@ -636,17 +816,20 @@ def main():
                     gamma = fino_cfg["gamma_max"] * (2 / (1 + math.exp(-10 * sample_fraction)) - 1) if fino_cfg else 0.0
                     meta = ((gamma, batch["meta_disc"].to(device, non_blocking=True),
                              {factor: batch[f"mc_{factor}"].to(device, non_blocking=True) for factor, _ in fino_cont}) if fino_cfg else None)
-                    dino_loss_value, patch_loss, kde, meta_loss = compute_losses(
+                    dino_loss_value, patch_loss, kde, meta_loss, aux_loss = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta,
+                        site=batch["site_id"].to(device, non_blocking=True) if (xsite_weight or site_center) else None,
+                        stain_x=batch["stain_view"].to(device, non_blocking=True) if stain_weight else None,
                     )
-                    total_loss = dino_loss_value + patch_loss + kde
+                    total_loss = dino_loss_value + patch_loss + kde + aux_loss
                     if meta_loss is not None:
                         total_loss = total_loss + meta_loss
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
-                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_patch_head.parameters()],
+                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_patch_head.parameters(),
+                     *(student_capi_head.parameters() if capi_clusters else ())],
                     dino_cfg["clip_grad"],
                 )
                 opt.step()
@@ -660,6 +843,8 @@ def main():
                 update_ema(student_dino_head, teacher_dino_head, m)
                 if teacher_patch_head is not None:
                     update_ema(student_patch_head, teacher_patch_head, m)
+                if teacher_capi_head is not None:
+                    update_ema(student_capi_head, teacher_capi_head, m)
             step_seconds = time.monotonic() - batch_started_at
             examples_seen += batch_size
             visible_patch_presentations += visible_now
@@ -669,7 +854,9 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     patch_name: float(patch_loss.detach()),
                     "kde": float(kde.detach()),
+                    "aux": float(aux_loss.detach()),
                     "total": float(total_loss.detach()),
+                    **loss_diag,
                 }
                 unique_counts = flush_unique_counts()
                 now = time.time()
@@ -725,7 +912,7 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  {patch_name}: {reduced[patch_name]:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  {patch_name}: {reduced[patch_name]:.4f}  kde: {reduced['kde']:.4f}  aux: {reduced['aux']:.4f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -853,6 +1040,18 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
+        "dmt_k": dmt_k,
+        "dmt_window": dmt_window,
+        "simdino": simdino,
+        "simdino_gamma": simdino_gamma,
+        "simdino_patch_gamma": simdino_patch_gamma,
+        "simdino_eps": simdino_eps,
+        "capi_clusters": capi_clusters,
+        "capi_weight": capi_weight,
+        "xsite_weight": xsite_weight,
+        "xsite_queue_size": xsite_queue_size,
+        "site_center": site_center,
+        "stain_weight": stain_weight,
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
