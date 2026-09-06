@@ -1,0 +1,141 @@
+# Arm A (idea 5) seed 13, no lr_key: FLOP-keyed LR schedule instead of finding-2's lr_key: sample.
+project:
+  name: nanopath-boot-gram-nolrkey-s13
+  family: nanopath
+  recipe_id: dinov2-vits14-reg-jepa-mask10
+  output_dir: /data/$USER/nanopath/main/nanopath-boot-gram-nolrkey-s13
+  wandb_dir: /data/$USER/nanopath/wandb
+data:
+  dataset_dir: /data/nanopath_parquet
+  split_seed: 7777
+  val_fraction: 0.05
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  global_crop_scale:
+  - 0.4
+  - 1.0
+  local_crop_scale:
+  - 0.08
+  - 0.35
+  color_jitter: 0.3
+  color_jitter_saturation: 0.30
+  hed_jitter: 0.07
+  tissue_thresh: 0.0
+model:
+  type: dinov2_vits14_reg
+train:
+  robust_norm: true
+  seed: 13
+  bf16: true
+  activation_checkpointing: false
+  batch_size: 128
+  num_workers: 16
+  prefetch_factor: 2
+  persistent_workers: true
+  max_train_samples: 1000000
+  max_train_flops: 1000000000000000000
+  log_every: 20
+  save_every: 1000
+  eval_every: 200
+  val_batches: 16
+  global_views: 2
+  local_views: 14
+  global_size: 224
+  local_size: 128
+  resume: null
+dino:
+  lr: 0.000125
+  lr_min: 1.0e-06
+  adam_beta2: 0.999
+  warmup_fraction: 0.0909
+  freeze_last_layer_fraction: 0.0091
+  layerwise_decay: 0.7
+  patch_embed_lr_mult: 0.2
+  drop_path_rate: 0.1
+  head_hidden_dim: 2048
+  head_bottleneck_dim: 384
+  clip_grad: 3.0
+  kde_loss_weight: 0.1
+  kde_concentration: 10.0
+  jepa_pred_depth: 10
+  jepa_pred_width: 0
+  jepa_pred_scratch: 5    # Bootleg predictor CLS + register tokens; 0 keeps the plain predictor
+  jepa_target_blocks: []  # teacher depths used as JEPA targets; [] means the final block alone
+  jepa_loss: smooth_l1    # "l2" switches to Bootleg's MSE objective
+  jepa_focal_gamma: 0.0    # >0 reweights masked tokens by err**gamma (scienceguru focal JEPA)
+  jepa_blocks: 4
+  jepa_block_scale: 0.1
+  gram_weight: 1.0        # calibrated: Gram MSE(init, final teacher) = 0.102 on real tiles, so ~0.10 at
+                          # full drift scale, next to jepa ~0.15. Mean patch-patch cos falls 0.81 -> 0.53
+                          # over a run, which is the dense degradation this is meant to arrest.
+  gram_layer: 12          # the PRETRAINED trunk's last block: with expansion the fresh blocks stay free
+  gram_start_frac: 0.25   # snapshot the frozen anchor teacher a quarter of the way in
+  freeze_backbone_fraction: 0.0
+probe:
+  enabled: true
+  model_weights: ema
+  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
+  datasets:
+    - bach
+    - bracs
+    - break_his
+    - crc
+    - esca
+    - mhist
+    - pcam
+    - spider_breast
+    - spider_colorectal
+    - spider_skin
+    - spider_thorax
+    - wilds
+  segmentation_datasets:
+    - pannuke
+    - segpath_epithelial
+    - segpath_lymphocytes
+  slide_datasets:
+    - ucla_lung
+  auc_datasets:
+    - surgen
+  survival_datasets:
+    - leopard_bcr
+    - cptac_pda_os
+  robustness_datasets:
+    - pathorob
+  dataset_roots:
+    bach: /data/thunder-data/bach
+    bracs: /data/thunder-data/bracs
+    break_his: /data/thunder-data/break_his
+    crc: /data/thunder-data/crc
+    esca: /data/thunder-data/esca
+    mhist: /data/thunder-data/mhist
+    pcam: /data/thunder-data/patch_camelyon
+    spider_breast: /data/thunder-data/spider_breast
+    spider_colorectal: /data/thunder-data/spider_colorectal
+    spider_skin: /data/thunder-data/spider_skin
+    spider_thorax: /data/thunder-data/spider_thorax
+    wilds: /data/thunder-data/wilds
+    pannuke: /data/thunder-data/pannuke
+    segpath_epithelial: /data/thunder-data/segpath_epithelial
+    segpath_lymphocytes: /data/thunder-data/segpath_lymphocytes
+    cptac_pda_os: /data/CPTAC-PDA
+    leopard_bcr: /data/leopard_bcr
+    pathorob: /data/pathorob
+    surgen: /data/surgen
+    ucla_lung: /data/ucla-lung
+fino:
+  enabled: true
+  gamma_max: 0.7
+  discrete:
+  - - subtype
+    - 1
+  continuous:
+  - - expr512
+    - 1
+  - - fga
+    - 1

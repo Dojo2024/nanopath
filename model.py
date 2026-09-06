@@ -1,0 +1,305 @@
+# ViT: clean ViT + 4 register tokens that loads Meta's `dinov2_vit{s,b,g}14_reg`
+# pretrained weights via state_dict (no xformers, no dinov2 codebase imports).
+# Attention runs on `F.scaled_dot_product_attention` so we get FlashAttention-2
+# on H100 bf16 with no third-party kernel dependency. Module names below match
+# Meta's checkpoint key layout exactly, so `load_dinov2_pretrained(model)` does
+# a strict load.
+#
+# DINOHead is the small MLP + weight-normed classifier used by train.py for the
+# DINO CLS self-distillation loss. It is intentionally trivial
+# (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+
+
+# (dim, depth, heads, pretrain_grid, ffn, pos_has_cls, weight URL[, registers]) for each supported variant.
+DINOV2_VARIANTS = {
+    "dinov2_vits14_reg": (384, 12, 6, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"),
+    "dinov2_vitb14_reg": (768, 12, 12, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth"),
+    "dinov2_vitg14_reg": (1536, 40, 24, 37, "swiglu", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitg14/dinov2_vitg14_reg4_pretrain.pth"),
+    # Block expansion: the DINOv2-S trunk plus 2 freshly initialised blocks. This has to be a VARIANT
+    # rather than a config knob because probe.py (locked) rebuilds the model as ViT(variant=cfg.model.type),
+    # so the depth must be recoverable from the variant name alone.
+    "dinov2_vits14_reg_x14": (384, 14, 6, 37, "mlp", True, "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"),
+}
+
+
+def probe_transforms():
+    # Default for Nanopath-trained checkpoints; baseline scripts override this in their request config.
+    transform = transforms.Compose([transforms.Resize((224, 224), antialias=True), transforms.ToTensor()])
+    # Keep the two return slots because probe.py separates tile-image and slide/patch-bag probes.
+    return transform, transform
+
+
+# Stochastic depth: keep_prob bernoulli on the residual branch, scaled to preserve mean.
+class DropPath(nn.Module):
+    def __init__(self, p): super().__init__(); self.p = float(p)
+    def forward(self, x):
+        if self.p == 0.0 or not self.training: return x
+        keep = 1.0 - self.p
+        mask = x.new_empty(x.shape[0], 1, 1).bernoulli_(keep)
+        return x * mask / keep
+
+
+# Per-channel learnable scale on residual branches; matches Meta's `ls1.gamma`/`ls2.gamma`.
+class LayerScale(nn.Module):
+    def __init__(self, dim): super().__init__(); self.gamma = nn.Parameter(torch.ones(dim))
+    def forward(self, x): return x * self.gamma
+
+
+# FINO gradient gate: identity forward, scales the gradient by `scale` on backward. sign>0 encourages the
+# encoder to predict a metadata factor (M+); sign<0 reverses the gradient to suppress it (M-, DANN-style).
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale): ctx.scale = scale; return x
+    @staticmethod
+    def backward(ctx, g): return g * ctx.scale, None
+
+
+# Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
+class Attention(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        hidden = (int(hidden * 2 / 3) + 7) // 8 * 8
+        self.w12 = nn.Linear(dim, 2 * hidden, bias=True)
+        self.w3 = nn.Linear(hidden, dim, bias=True)
+
+    def forward(self, x):
+        a, b = self.w12(x).chunk(2, dim=-1)
+        return self.w3(F.silu(a) * b)
+
+
+# Standard pre-LN block: attn + ls1 + drop_path, then mlp + ls2 + drop_path.
+class Block(nn.Module):
+    def __init__(self, dim, heads, mlp_ratio, drop_path_p, ffn="mlp"):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.attn = Attention(dim, heads)
+        self.ls1 = LayerScale(dim)
+        self.drop_path1 = DropPath(drop_path_p)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.mlp = SwiGLU(dim, hidden) if ffn == "swiglu" else nn.Sequential()
+        if ffn == "mlp":
+            self.mlp.fc1 = nn.Linear(dim, hidden, bias=True)
+            self.mlp.fc2 = nn.Linear(hidden, dim, bias=True)
+        self.ls2 = LayerScale(dim)
+        self.drop_path2 = DropPath(drop_path_p)
+
+    def _ff(self, x): return self.mlp(x) if isinstance(self.mlp, SwiGLU) else self.mlp.fc2(F.gelu(self.mlp.fc1(x)))
+
+    def forward(self, x):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path2(self.ls2(self._ff(self.norm2(x))))
+        return x
+
+
+# ViT-S/B-14 with 4 register tokens; key layout matches Meta's DINOv2 register checkpoints
+# (cls_token, register_tokens, pos_embed (1, 1+37^2, dim), mask_token (1, dim), patch_embed.proj,
+# blocks.{i}.{norm1,norm2,attn.qkv,attn.proj,ls1,ls2,mlp.fc1,mlp.fc2}, norm).
+# Pos embed is bicubically interpolated at runtime to the current patch grid.
+# Meta DINOv2 includes a cls pos and uses 37x37 patches; variant_cfg can override this for probes.
+class ViT(nn.Module):
+    def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, variant_cfg=None):
+        super().__init__()
+        cfg = variant_cfg or DINOV2_VARIANTS[variant]
+        dim, depth, heads, pretrain_grid, ffn, pos_has_cls, _ = cfg[:7]
+        mlp_ratio, patch, registers = 4.0, 14, cfg[7] if len(cfg) > 7 else 4
+        self.variant = variant
+        self.patch_size, self.registers, self.embed_dim = patch, registers, dim
+        self._pretrain_grid, self._pos_has_cls = pretrain_grid, pos_has_cls
+        self.patch_embed = nn.Module()
+        self.patch_embed.proj = nn.Conv2d(3, dim, kernel_size=patch, stride=patch, bias=True)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.register_tokens = nn.Parameter(torch.zeros(1, registers, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, int(self._pos_has_cls) + self._pretrain_grid**2, dim))
+        self.mask_token = nn.Parameter(torch.zeros(1, dim))
+        rates = [drop_path_rate * i / max(1, depth - 1) for i in range(depth)]
+        self.blocks = nn.ModuleList(Block(dim, heads, mlp_ratio, p, ffn=ffn) for p in rates)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        # Post-training scanner directions are checkpointed like normalization statistics.
+        self.register_buffer("rn_fitted", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("rn_mu", torch.zeros(2, dim))
+        self.register_buffer("rn_v", torch.zeros(2, 32, dim))
+        self.register_buffer("pf_fitted", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("pf_mu", torch.zeros(5, dim))
+        self.register_buffer("pf_v", torch.zeros(5, 1, dim))
+
+    # Bicubic resample of the checkpoint patch-pos grid to the current (h, w) grid.
+    def _interpolate_pos_embed(self, h, w):
+        cls_pos = self.pos_embed[:, :1] if self._pos_has_cls else None
+        g = self._pretrain_grid
+        patch_pos = self.pos_embed[:, int(self._pos_has_cls):].reshape(1, g, g, -1).permute(0, 3, 1, 2).float()
+        # antialias=True matches Meta's default for DINOv2 `_reg` variants.
+        patch_pos = F.interpolate(patch_pos, size=(h, w), mode="bicubic", align_corners=False, antialias=True)
+        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
+        return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
+
+    # Build [cls, registers, patches] tokens; masked patch positions are replaced by mask_token.
+    def _prepare_tokens(self, x, masks=None):
+        B, _, H, W = x.shape
+        h, w = H // self.patch_size, W // self.patch_size
+        x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
+        if masks is not None:
+            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
+        cls = self.cls_token.expand(B, -1, -1)
+        regs = self.register_tokens.expand(B, -1, -1)
+        if self._pos_has_cls:
+            x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
+            return torch.cat([x[:, :1], regs, x[:, 1:]], dim=1)
+        return torch.cat([cls, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
+
+    # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
+    # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
+    # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
+    def _suppress(self, x, mu, v):
+        centered = x.float() - mu
+        return (centered - (centered @ v.T) @ v + mu).to(x.dtype)
+
+    # `taps` are 1-indexed block depths whose patch tokens are also returned under "tapped", so one
+    # teacher forward supplies Bootleg's multi-depth JEPA targets. A tap at the final block is passed
+    # through the final norm, matching the plain "patches" target exactly when taps == (depth,).
+    def forward(self, x, masks=None, checkpoint=False, taps=()):
+        x = self._prepare_tokens(x, masks)
+        cache = {}
+        for i, blk in enumerate(self.blocks, start=1):
+            if checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
+            if i in taps:
+                cache[i] = x
+        x = self.norm(x)
+        cls, patches = x[:, 0], x[:, 1 + self.registers :]
+        if not self.training and self.rn_fitted:
+            cls = self._suppress(cls, self.rn_mu[0], self.rn_v[0])
+            patch_mean = patches.mean(1)
+            patches = patches + (self._suppress(patch_mean, self.rn_mu[1], self.rn_v[1]) - patch_mean).unsqueeze(1)
+        out = {
+            "cls": cls,
+            "registers": x[:, 1 : 1 + self.registers],
+            "patches": patches,
+        }
+        if taps:
+            depth = len(self.blocks)
+            out["tapped"] = [(self.norm(cache[i]) if i == depth else cache[i])[:, 1 + self.registers :] for i in taps]
+        return out
+
+    # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
+    # and strided-depth CLS features that are less tied to the final DINO head.
+    def encode_image(self, x, checkpoint=False):
+        B, _, H, W = x.shape
+        h, w, G = H // self.patch_size, W // self.patch_size, 32
+        guide = x.mean(1, keepdim=True)
+        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = torch.utils.checkpoint.checkpoint(blk, xt, use_reentrant=False) if checkpoint and self.training else blk(xt)
+            if i >= len(self.blocks) - 4:
+                feats.append(self.norm(xt)[:, 1:])
+        fused = torch.cat(feats, -1)
+        patches = fused[:, self.registers:]
+        up = F.interpolate(patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float(), size=(G, G), mode="bilinear", align_corners=False)
+        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
+        guide_hr = F.interpolate(guide, size=(G, G), mode="area")
+        w_range = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(G, G), mode="nearest")).abs() ** 2) / 0.02)
+        blur = F.avg_pool2d(F.pad(up, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
+        return dense
+
+    def probe_features(self, x):
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = blk(xt)
+            if i in (2, 4, 6, 8, 11):
+                f = self.norm(xt)[:, 0]
+                j = len(feats)
+                feats.append(self._suppress(f, self.pf_mu[j], self.pf_v[j]) if not self.training and self.pf_fitted else f)
+        return torch.cat(feats, dim=-1)
+
+
+# Strict-load Meta's pretrained weights for the model's declared variant.
+# Strict matches our key layout against Meta's; any drift fails loudly per AGENTS.md.
+def load_dinov2_pretrained(model):
+    *_, url = DINOV2_VARIANTS[model.variant]
+    state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Blocks beyond the checkpoint's own depth are the expansion blocks and stay at their init.
+    pretrained_depth = 1 + max(int(k.split(".")[1]) for k in state if k.startswith("blocks."))
+    fresh = lambda k: k.startswith("blocks.") and int(k.split(".")[1]) >= pretrained_depth
+    assert not unexpected and all(k.startswith(("rn_", "pf_")) or fresh(k) for k in missing), (missing, unexpected)
+    return model
+
+
+# DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
+# weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
+# behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
+class DINOHead(nn.Module):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3):
+        super().__init__()
+        layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+        for _ in range(nlayers - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+        self.mlp = nn.Sequential(*layers)
+        self.last_layer = nn.utils.parametrizations.weight_norm(nn.Linear(bottleneck_dim, n_prototypes, bias=False))
+        # weight-norm under torch.nn.utils.parametrizations exposes `parametrizations.weight.original0/1`;
+        # original0 is the magnitude vector (size n_prototypes). Freeze it at 1 to match dinov2's recipe.
+        with torch.no_grad():
+            self.last_layer.parametrizations.weight.original0.fill_(1.0)
+        self.last_layer.parametrizations.weight.original0.requires_grad_(False)
+
+    def forward(self, x):
+        x = self.mlp(x)
+        x = F.normalize(x, dim=-1, p=2)
+        return self.last_layer(x)
+
+
+# I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
+# block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
+# of a discrete metadata factor to every patch token, so the latent-regression target is metadata-aware
+# (a dense-path alternative to CLS-token steering). n_cond=0 is plain I-JEPA.
+class JEPAPredictor(nn.Module):
+    # `scratch` prepends Bootleg's predictor-local CLS + register tokens (paper Table 4: +2.2% and
+    # +1.4%); they give the predictor global working space and are dropped from the returned patch
+    # predictions. `n_targets` > 1 emits that many concatenated per-depth predictions from one head.
+    def __init__(self, dim, depth=4, width=0, heads=6, n_cond=0, scratch=0, n_targets=1):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.cond_emb = nn.Embedding(n_cond + 1, width) if n_cond else None
+        self.scratch = nn.Parameter(torch.zeros(1, scratch, width)) if scratch else None
+        self.n_scratch = scratch
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim * n_targets, bias=True)
+        if self.scratch is not None:
+            nn.init.trunc_normal_(self.scratch, std=0.02)
+
+    def forward(self, patch_tokens, cond=None):
+        x = self.proj_in(patch_tokens)
+        if self.cond_emb is not None and cond is not None:
+            x = x + self.cond_emb(cond + 1).unsqueeze(1)  # broadcast factor embedding over patches; cond=-1 -> idx 0
+        if self.scratch is not None:
+            x = torch.cat([self.scratch.expand(x.shape[0], -1, -1), x], dim=1)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.proj(self.norm(x))[:, self.n_scratch :]
