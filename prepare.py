@@ -39,7 +39,7 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parent
 HF_TRAIN_REPO_ID = "medarc/nanopath"
 HF_EVAL_REPO_ID = "medarc/nanopath-evals"
-HF_EVAL_REVISION = "635a83330b0dc2917d7524644f11b04188a63e53"
+HF_EVAL_REVISION = "5c8f7848298fa55e09e0bcc58a90a8e9b1c8d426"
 TILE_SIZE = 224
 JPEG_QUALITY = 95
 TARGET_TILE_COUNT = 4_000_000
